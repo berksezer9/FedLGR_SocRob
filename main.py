@@ -136,6 +136,13 @@ def run(args):
     elif args.model == 'DeepLabMobileNet':
         from models.deepLabMobileNet import Net
 
+    # None (default) reproduces vendor's original MANNERS-DB column names; a
+    # comma-separated --action_cols/--extra_cols CLI value overrides them
+    # (OfficeDB's 9 actions, no circle/arrow columns -- see
+    # OFFICEDB_MODIFICATIONS.md).
+    action_cols = args.action_cols.split(',') if args.action_cols else None
+    extra_cols = args.extra_cols.split(',') if args.extra_cols else None
+
     experiment_path = f"{args.output}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.strategy}_{args.model}_{args.rounds}_{args.icl}_{args.fcl}_{args.aug}_{args.base}_{args.processor_type}"
     if not os.path.exists(experiment_path):
         os.makedirs(experiment_path)
@@ -179,9 +186,9 @@ def run(args):
             strategies = [args.strategy]
 
         for strat in strategies:
-            net = Net()
-            central_model = Net()
-            
+            net = Net(num_classes=args.num_classes)
+            central_model = Net(num_classes=args.num_classes)
+
             path = f"{args.output}/{n_cl}/{strat}"
             if not os.path.exists(path):
                 os.mkdir(path)
@@ -193,11 +200,15 @@ def run(args):
             if 'Distill' in strat:
                 trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
                                                                                      distil=True, out=path, DEVICE=DEVICE,
-                                                                                     data_permutation=data_permutation, teacher_model=net)
+                                                                                     data_permutation=data_permutation, teacher_model=net,
+                                                                                     action_cols=action_cols, extra_cols=extra_cols,
+                                                                                     split_col=args.split_col, group_col=args.group_col)
             else:
                 trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
-                                                                                     DEVICE=DEVICE, data_permutation=data_permutation)
-            
+                                                                                     DEVICE=DEVICE, data_permutation=data_permutation,
+                                                                                     action_cols=action_cols, extra_cols=extra_cols,
+                                                                                     split_col=args.split_col, group_col=args.group_col)
+
             # params = get_parameters(net)
             if strat == 'FedAvg':
                 strategy = FedAvgWithAccuracyMetric(
@@ -270,10 +281,14 @@ def run(args):
                     if 'Distill' in base:
                         trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
                                                                                             distil=True, out=path, DEVICE=DEVICE,
-                                                                                            data_permutation=data_permutation, teacher_model=net)
+                                                                                            data_permutation=data_permutation, teacher_model=net,
+                                                                                            action_cols=action_cols, extra_cols=extra_cols,
+                                                                                            split_col=args.split_col, group_col=args.group_col)
                     else:
                         trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
-                                                                                            DEVICE=DEVICE, data_permutation=data_permutation)
+                                                                                            DEVICE=DEVICE, data_permutation=data_permutation,
+                                                                                            action_cols=action_cols, extra_cols=extra_cols,
+                                                                                            split_col=args.split_col, group_col=args.group_col)
 
                     # params = get_parameters(net.conv_module)
                     if base == 'FedAvg':
@@ -400,6 +415,11 @@ if __name__ == "__main__":
     parser.add_argument("-a", "--aug", type=eval, choices=[True, False], default='False', help="Use Augmentation?")
     parser.add_argument("-b", "--base", type=str, default="FedAvg", help="Default base for FedRoot Only")
     parser.add_argument("-t", "--processor_type", type=str, default="cpu", help="Processor Type")
+    parser.add_argument("--num_classes", type=int, default=8, help="Number of action output heads (8=MANNERS-DB, 9=OfficeDB)")
+    parser.add_argument("--group_col", type=str, default=None, help="Column assigning clients by group (robot/room) instead of random_split; #unique values must equal #clients")
+    parser.add_argument("--split_col", type=str, default=None, help="Column with pre-computed train/test labels, used instead of the internal random 75/25 split")
+    parser.add_argument("--action_cols", type=str, default=None, help="Comma-separated action column names (default: MANNERS-DB's 8 hardcoded names)")
+    parser.add_argument("--extra_cols", type=str, default=None, help="Comma-separated pass-through id columns, e.g. group/task/split columns (default: 'Using circle,Using arrow')")
     args = parser.parse_args()
 
     print("Running with the following arguments:")

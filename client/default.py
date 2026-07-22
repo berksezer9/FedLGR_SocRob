@@ -66,7 +66,7 @@ class FlowerClient(fl.client.NumPyClient):
 
 class FlowerClientCL(fl.client.NumPyClient):
 	def __init__(self, cid, net, trainloader, valloader, testloader, epochs, y_labels, cl_strategy, agent_config, nrounds, path, DEVICE, num_clients,
-	             strat_name, params):
+	             strat_name, params, n_tasks=2):
 		self.cid = cid
 		# self.net = net
 		self.trainloaders = trainloader
@@ -80,13 +80,26 @@ class FlowerClientCL(fl.client.NumPyClient):
 		self.DEVICE = DEVICE
 		self.num_clients = num_clients
 		self.strat_name = strat_name
-	
+		# n_tasks=2 reproduces the original hardcoded circle/arrow 2-task split
+		# (rounds_per_task == nrounds/2); OfficeDB's Axis A/B pass n_tasks=3/6
+		# (see OFFICEDB_MODIFICATIONS.md).
+		self.n_tasks = n_tasks
+		self.rounds_per_task = self.nrounds // n_tasks
+
+	def _task_idx(self, server_round):
+		return min((server_round - 1) // self.rounds_per_task, self.n_tasks - 1)
+
+	def _is_boundary(self, server_round, task_idx):
+		# Last round of a task (except the last task, which has no further
+		# task to prepare importance/replay for).
+		return (server_round % self.rounds_per_task == 0) and (task_idx < self.n_tasks - 1)
+
 	def get_parameters(self, config):
 		print(f"[Client {self.cid}] get_parameters")
 		# self.net.train()
 		self.strat.model.train()
 		return [val.cpu().numpy() for _, val in self.strat.model.state_dict().items()]
-	
+
 	def set_parameters(self, parameters: List[np.ndarray]) -> None:
 		# self.net.train()
 		print(f"[Client {self.cid}] set_parameters")
@@ -94,7 +107,7 @@ class FlowerClientCL(fl.client.NumPyClient):
 		params_dict = zip(self.strat.model.state_dict().keys(), parameters)
 		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
 		self.strat.model.load_state_dict(state_dict, strict=True)
-	
+
 	def fit(self, parameters, config):
 		ramu = RAMU()
 		init_ram = ramu.compute("Train")
@@ -111,68 +124,51 @@ class FlowerClientCL(fl.client.NumPyClient):
 				reg_term = pickle.load(f)
 		except:
 			reg_term = {}
-		
-		if config["server_round"] < int(self.nrounds / 2):
-			# self.net = copy.deepcopy(self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term,
-			#                                                 train_loader=self.trainloaders[0][int(self.cid)], learn_ewc=False))
-			peak_ramu = self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term, train_loader=self.trainloaders[0][int(self.cid)],
-			                                   learn_ewc=False)
-		# reg_term = self.strat.regularization_terms
-		
-		elif config["server_round"] == int(self.nrounds / 2):
+
+		server_round = config["server_round"]
+		task_idx = self._task_idx(server_round)
+		train_loader = self.trainloaders[task_idx][int(self.cid)]
+
+		if self._is_boundary(server_round, task_idx):
 			task_count += 1
-			# self.net = copy.deepcopy(self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term,
-			#                                                 train_loader=self.trainloaders[0][int(self.cid)], learn_ewc=True))
-			
-			peak_ramu = self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term, train_loader=self.trainloaders[0][int(self.cid)],
+			peak_ramu = self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term, train_loader=train_loader,
 			                                   learn_ewc=True)
-			
+
 			reg_term = self.strat.regularization_terms
 			with open(f'{self.path}/reg{int(self.cid)}.pkl', 'wb') as f:  # Python 3: open(..., 'wb')
 				pickle.dump(reg_term, f)
 			with open(f'{self.path}/task{int(self.cid)}.txt', 'w+') as f:  # Python 3: open(..., 'wb')
 				f.write(f'{task_count}')
 		else:
-			# self.net = copy.deepcopy(self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term,
-			#                                                 train_loader=self.trainloaders[1][int(self.cid)], learn_ewc=False))
-			
-			peak_ramu = self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term, train_loader=self.trainloaders[1][int(self.cid)],
+			peak_ramu = self.strat.learn_batch(task_count=task_count, regularization_terms=reg_term, train_loader=train_loader,
 			                                   learn_ewc=False)
-		# reg_term = self.strat.regularization_terms
-		
+
 		if not os.path.exists(f'{self.path}/clientwise'):
 			os.makedirs(f'{self.path}/clientwise')
 		with open(f'{self.path}/clientwise/ramu{int(self.cid)}.csv', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{init_ram},{peak_ramu},{peak_ramu - init_ram}\n')
-		if config['server_round'] <= int(self.nrounds / 2):
-			return self.get_parameters(config={}), len(self.trainloaders[0][int(self.cid)]), {}
-		
-		return self.get_parameters(config={}), len(self.trainloaders[1][int(self.cid)]), {}
-	
+		return self.get_parameters(config={}), len(train_loader), {}
+
 	def evaluate(self, parameters, config):
 		# check if {self.path}/{self.num_clients} exists, if not create it
 		if not os.path.exists(f'{self.path}/clientwise'):
 			os.makedirs(f'{self.path}/clientwise')
-		
+
 		self.set_parameters(parameters)
 		# self.strat.load_model(parameters)
-		if config["server_round"] <= int(self.nrounds / 2):
-			loss, avg_pearson, avg_rmse = test(self.strat.model, self.valloader[0], self.y_labels, self.DEVICE)
-		# loss, avg_pearson, avg_rmse = self.strat.test(self.valloader[0])
-		else:
-			loss, avg_pearson, avg_rmse = test(self.strat.model, self.testloader, self.y_labels, self.DEVICE)
-		# loss, avg_pearson, avg_rmse = self.strat.test(self.testloader)
+		# self.valloader is the cumulative per-task-boundary test loader list
+		# (tasks 0..task_idx combined) -- see task_splitter in dataloader/utils.py.
+		eval_loader = self.valloader[self._task_idx(config["server_round"])]
+		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, self.y_labels, self.DEVICE)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
-		if config["server_round"] <= int(self.nrounds / 2):
-			return float(loss), len(self.valloader[0]), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
-		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
+		return float(loss), len(eval_loader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
 
 
 class FlowerClient_NR(fl.client.NumPyClient):
 	def __init__(self, cid, net, trainloader, valloader, testloader, epochs, y_labels, cl_strategy, agent_config, nrounds, path, DEVICE, num_clients,
-	             strat_name, params):
+	             strat_name, params, n_tasks=2):
 		self.cid = cid
 		# self.net = net
 		self.trainloaders = trainloader
@@ -186,13 +182,26 @@ class FlowerClient_NR(fl.client.NumPyClient):
 		self.DEVICE = DEVICE
 		self.num_clients = num_clients
 		self.strat_name = strat_name
-	
+		# See FlowerClientCL for n_tasks/rounds_per_task (OFFICEDB_MODIFICATIONS.md).
+		# NOTE: NR's reg{cid}.pkl only ever stores the immediately-preceding
+		# task's memory (vendor's own original design, not something this
+		# generalization changes) -- for n_tasks>2 this means rehearsal only
+		# ever replays the most recent prior task, not the full task history.
+		self.n_tasks = n_tasks
+		self.rounds_per_task = self.nrounds // n_tasks
+
+	def _task_idx(self, server_round):
+		return min((server_round - 1) // self.rounds_per_task, self.n_tasks - 1)
+
+	def _is_boundary(self, server_round, task_idx):
+		return (server_round % self.rounds_per_task == 0) and (task_idx < self.n_tasks - 1)
+
 	def get_parameters(self, config):
 		print(f"[Client {self.cid}] get_parameters")
 		# self.net.train()
 		self.strat.model.train()
 		return [val.cpu().numpy() for _, val in self.strat.model.state_dict().items()]
-	
+
 	def set_parameters(self, parameters: List[np.ndarray]) -> None:
 		print(f"[Client {self.cid}] set_parameters")
 		# self.net.train()
@@ -200,29 +209,31 @@ class FlowerClient_NR(fl.client.NumPyClient):
 		params_dict = zip(self.strat.model.state_dict().keys(), parameters)
 		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
 		self.strat.model.load_state_dict(state_dict, strict=True)
-	
+
 	def fit(self, parameters, config):
 		ramu = RAMU()
 		init_ram = ramu.compute("Train")
 		print(f"[Client {self.cid}] fit, config: {config}")
-		
+
 		self.set_parameters(parameters)
 		try:
 			with open(f'{self.path}/task{int(self.cid)}.txt', 'r') as f:  # Python 3: open(..., 'rb')
 				task_count = int(f.readline())
 		except:
 			task_count = 0
-		
-		if config["server_round"] < int(self.nrounds / 2):
-			# self.net = copy.deepcopy(self.strat.learn_batch(task_count, {}, self.trainloaders[0][int(self.cid)], learn_nr=False))
-			peak_ram = self.strat.learn_batch(task_count, {}, self.trainloaders[0][int(self.cid)], learn_nr=False)
-			memory = self.strat.task_memory
-		
-		elif config["server_round"] == int(self.nrounds / 2):
+
+		server_round = config["server_round"]
+		task_idx = self._task_idx(server_round)
+		train_loader = self.trainloaders[task_idx][int(self.cid)]
+		is_boundary = self._is_boundary(server_round, task_idx)
+
+		if task_idx == 0 and not is_boundary:
+			peak_ram = self.strat.learn_batch(task_count, {}, train_loader, learn_nr=False)
+
+		elif is_boundary:
 			task_count += 1
-			# self.net = copy.deepcopy(self.strat.learn_batch(task_count, {}, self.trainloaders[0][int(self.cid)], learn_nr=True))
-			peak_ram = self.strat.learn_batch(task_count, {}, self.trainloaders[0][int(self.cid)], learn_nr=True)
-			
+			peak_ram = self.strat.learn_batch(task_count, {}, train_loader, learn_nr=True)
+
 			with open(f'{self.path}/reg{int(self.cid)}.pkl', 'wb') as f:  # Python 3: open(..., 'wb')
 				pickle.dump(self.strat.task_memory[task_count].storage, f)
 		else:
@@ -230,37 +241,29 @@ class FlowerClient_NR(fl.client.NumPyClient):
 				storage = pickle.load(f)
 			memory = {task_count: Memory()}
 			memory[task_count].update(storage)
-			# self.net = copy.deepcopy(self.strat.learn_batch(task_count, memory, self.trainloaders[1][int(self.cid)], learn_nr=False))
-			peak_ram = self.strat.learn_batch(task_count, memory, self.trainloaders[1][int(self.cid)], learn_nr=False)
-			memory = self.strat.task_memory
-			if config["server_round"] == int(self.nrounds):
+			peak_ram = self.strat.learn_batch(task_count, memory, train_loader, learn_nr=False)
+			if server_round == int(self.nrounds):
 				if os.path.exists(f'{self.path}/reg{int(self.cid)}.pkl'):
 					os.remove(f'{self.path}/reg{int(self.cid)}.pkl')
 		if not os.path.exists(f'{self.path}/clientwise'):
 			os.makedirs(f'{self.path}/clientwise')
 		with open(f'{self.path}/clientwise/ramu{int(self.cid)}.csv', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{init_ram},{peak_ram},{peak_ram - init_ram}\n')
-		
+
 		with open(f'{self.path}/task{int(self.cid)}.txt', 'w+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{task_count}')
-		if config['server_round'] <= int(self.nrounds / 2):
-			return self.get_parameters(config={}), len(self.trainloaders[0][int(self.cid)]), {}
-		return self.get_parameters(config={}), len(self.trainloaders[1][int(self.cid)]), {}
-	
+		return self.get_parameters(config={}), len(train_loader), {}
+
 	def evaluate(self, parameters, config):
 		# check if {self.path}/{self.num_clients} exists, if not create it
 		if not os.path.exists(f'{self.path}/clientwise'):
 			os.makedirs(f'{self.path}/clientwise')
-		
+
 		# set_parameters(self.strat.model, parameters)
 		self.set_parameters(parameters)
-		if config["server_round"] <= int(self.nrounds / 2):
-			loss, avg_pearson, avg_rmse = test(self.strat.model, self.valloader[0], self.y_labels, self.DEVICE)
-		else:
-			loss, avg_pearson, avg_rmse = test(self.strat.model, self.testloader, self.y_labels, self.DEVICE)
+		eval_loader = self.valloader[self._task_idx(config["server_round"])]
+		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, self.y_labels, self.DEVICE)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
-		if config["server_round"] <= int(self.nrounds / 2):
-			return float(loss), len(self.valloader[0]), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
-		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
+		return float(loss), len(eval_loader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}

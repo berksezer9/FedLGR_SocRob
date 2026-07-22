@@ -12,12 +12,32 @@ sys.path.append('..')
 from utils import predict_gen, train, predict_gen_distil
 
 
-def load_universal(path):
+# Default column layout matches vendor's original MANNERS-DB `all_data.csv`
+# (see OFFICEDB_MODIFICATIONS.md). `load_universal`/`load_images` accept
+# overrides so OfficeDB's 9-action, non-circle/arrow layout can pass straight
+# through instead of being shimmed into these literal names.
+_DEFAULT_ACTION_COLS = [
+	'Vacuum cleaning', 'Mopping the floor', 'Carry warm food', 'Carry cold food',
+	'Carry drinks', 'Carry small objects (plates, toys)', 'Carry big objects (tables, chairs)',
+	'Cleaning (Picking up stuff) / Starting conversation',
+]
+_DEFAULT_EXTRA_COLS = ['Using circle', 'Using arrow']
+
+
+def load_universal(path, stamp_col='Stamp', mean_cols=None):
 	data = pd.read_csv(path + "/all_data.csv")
-	df = pd.DataFrame(columns=data.columns)
-	for i in range(250, 1000):
-		df = pd.concat([df, (data.loc[data['Stamp'] == i].mean()).to_frame().T], ignore_index=True)
-	# df=df.append(data.loc[data['Stamp'] == i].mean(), ignore_index=True)
+	# mean_cols are averaged across annotators per stamp (original behaviour);
+	# everything else (group/task/split id columns, which are constant within
+	# a stamp) is carried through via 'first' instead of 'mean', since those
+	# can be non-numeric (e.g. split='train') and .mean() can't handle that.
+	# Original code meant every column via a range(250, 1000) window, which
+	# both hardcoded a 3-digit-stamp assumption and silently capped capacity
+	# at 750 stamps -- too few for OfficeDB's 1000 images/robot. Iterating the
+	# actual unique stamps removes both limitations.
+	if mean_cols is None:
+		mean_cols = [c for c in data.columns if c != stamp_col]
+	agg = {c: ('mean' if c in mean_cols else 'first') for c in data.columns if c != stamp_col}
+	df = data.groupby(stamp_col, as_index=False).agg(agg)
 	return df
 
 
@@ -29,59 +49,81 @@ def load_augmented(df):
 	return data_new
 
 
-def load_images(path):
+def sort_nicely(l):
+	""" Sort the given list in the way that humans expect.
+	"""
 	import re
-	def sort_nicely(l):
-		""" Sort the given list in the way that humans expect.
-		"""
+	convert = lambda text: int(text) if text.isdigit() else text
+	alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
+	l.sort(key=alphanum_key)
+	return l
 
-		convert = lambda text: int(text) if text.isdigit() else text
-		alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
-		l.sort(key=alphanum_key)
-		return l
-	
-	
-	df = load_universal(path)
-	path = path + "/images"
-	li = sort_nicely(os.listdir(path))
-	data_images = pd.DataFrame(columns=['Stamp', 'path'] + list(df.columns[1:3]) + list(df.columns[-8:]))
 
-	for i in range(len(li)):
+def load_images(path, action_cols=None, extra_cols=None, stamp_col='Stamp'):
+	# action_cols/extra_cols default to MANNERS-DB's original 8 actions +
+	# circle/arrow columns; OfficeDB adaptation passes its own 9 action names
+	# and group/task/split id columns instead (see OFFICEDB_MODIFICATIONS.md).
+	action_cols = list(action_cols) if action_cols is not None else list(_DEFAULT_ACTION_COLS)
+	extra_cols = list(extra_cols) if extra_cols is not None else list(_DEFAULT_EXTRA_COLS)
+
+	df = load_universal(path, stamp_col=stamp_col, mean_cols=action_cols)
+	imgpath = path + "/images"
+	li = sort_nicely(os.listdir(imgpath))
+	columns = [stamp_col, 'path'] + extra_cols + action_cols
+
+	rows = []
+	for fname in li:
 		try:
-			entry = [float(li[i][:3]),
-					 f'{path}/' + li[i],
-					 int(df[df['Stamp'] == float(li[i][:3])]['Using circle']),
-					 int(df[df['Stamp'] == float(li[i][:3])]['Using arrow']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Vacuum cleaning']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Mopping the floor']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Carry warm food']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Carry cold food']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Carry drinks']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Carry small objects (plates, toys)']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Carry big objects (tables, chairs)']),
-					 float(df[df['Stamp'] == float(li[i][:3])]['Cleaning (Picking up stuff) / Starting conversation'])
-					 ]
-			new_df = pd.DataFrame([entry], columns=data_images.columns)
-			data_images = pd.concat([data_images, new_df], ignore_index=True)
-		except:
+			# Original sliced the first 3 filename characters (`fname[:3]`),
+			# which silently mis-parses any stamp >= 1000 (e.g. "1000_..."
+			# -> "100"). Splitting on the first underscore reads the whole
+			# leading integer regardless of digit width -- needed since
+			# OfficeDB pools can exceed 999 distinct stamps (e.g. by-robot's
+			# 3000-image combined pool). Exact match for the <1000 case.
+			stamp = float(fname.split('_')[0])
+			row = df[df[stamp_col] == stamp]
+			entry = [stamp, f'{imgpath}/' + fname]
+			entry += [row[c].iloc[0] for c in extra_cols]
+			entry += [float(row[c].iloc[0]) for c in action_cols]
+			rows.append(entry)
+		except Exception:
 			print('Error Loading FileName; Continuing to next.')
 
-	return data_images
+	return pd.DataFrame(rows, columns=columns)
 
 
 def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.device("cpu"), data_permutation=None,
-				  distil=False, teacher_model=None):
-	data = load_images(path)
-	if data_permutation is None:
-		data_permutation = np.random.permutation(len(data))
-	data = data.iloc[data_permutation]
-	# Splitting 75% Train and 25% Test Data
-	data_images_train = data.iloc[:int(data.shape[0] * 0.75)]
+				  distil=False, teacher_model=None, action_cols=None, extra_cols=None, split_col=None, group_col=None):
+	# action_cols/extra_cols: see load_images. split_col: if given and present
+	# in the built dataframe, honor its train/test labels instead of the
+	# internal random 75/25 split (lets this reuse data/splits/*.csv's
+	# leakage-safe 80/10/10 splits; 'val' rows are simply not consumed here,
+	# since this training loop -- like vendor's original -- has no validation
+	# phase). group_col: if given, assign each client ALL rows of one unique
+	# group value (robot or room) instead of blind random_split -- needed for
+	# by-robot/by-room non-IID partitioning. Both are additive: omitting them
+	# reproduces the original random-permutation/random-split behaviour
+	# exactly. See OFFICEDB_MODIFICATIONS.md.
+	action_cols = list(action_cols) if action_cols is not None else list(_DEFAULT_ACTION_COLS)
+	extra_cols = list(extra_cols) if extra_cols is not None else list(_DEFAULT_EXTRA_COLS)
+	label_start = 2 + len(extra_cols)
+
+	data = load_images(path, action_cols=action_cols, extra_cols=extra_cols)
+
+	if split_col is not None and split_col in data.columns:
+		data_images_train = data[data[split_col] == 'train'].reset_index(drop=True)
+		data_images_test = data[data[split_col] == 'test'].reset_index(drop=True)
+	else:
+		if data_permutation is None:
+			data_permutation = np.random.permutation(len(data))
+		data = data.iloc[data_permutation]
+		# Splitting 75% Train and 25% Test Data
+		data_images_train = data.iloc[:int(data.shape[0] * 0.75)].reset_index(drop=True)
+		data_images_test = data.iloc[int(data.shape[0] * 0.75):].reset_index(drop=True)
+
 	data_images_train = data_images_train.sample(frac=1).reset_index(drop=True)
-	
-	data_images_test = data.iloc[int(data.shape[0] * 0.75):]
 	data_images_test = data_images_test.sample(frac=1).reset_index(drop=True)
-	
+
 	if aug:
 		train_transform = transforms.Compose([
 			transforms.Resize((128, 128)),
@@ -106,9 +148,9 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 		transforms.ToTensor(),
 		transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 	])
-	trainset = CustomDataset(dataframe=data_images_train, transform=train_transform)
-	testset = CustomDataset(dataframe=data_images_test, transform=test_transform)
-	
+	trainset = CustomDataset(dataframe=data_images_train, transform=train_transform, label_start=label_start)
+	testset = CustomDataset(dataframe=data_images_test, transform=test_transform, label_start=label_start)
+
 	if distil:
 		if os.path.exists(f'{out}/teacher_model.pt'):
 			teacher_model.to(DEVICE)
@@ -126,25 +168,39 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 			torch.save(teacher_model.state_dict(), f'{out}/teacher_model_cuda.pt')
 		else:
 			torch.save(teacher_model.state_dict(), f'{out}/teacher_model.pt')
-	
+
 		outputs = pd.DataFrame(predict_gen_distil(teacher_model, train_loader_distil, DEVICE))
-		trainset = CustomDataset(dataframe=pd.concat([data_images_train.iloc[:len(outputs), :4], outputs], axis=1, ignore_index=True),
-		                        transform=train_transform)
-	
+		trainset = CustomDataset(dataframe=pd.concat([data_images_train.iloc[:len(outputs), :label_start], outputs], axis=1, ignore_index=True),
+		                        transform=train_transform, label_start=label_start)
 
-	# Split training set into `num_clients` partitions to simulate different local datasets
-	partition_size = len(trainset) // num_clients
 
-	lengths = [partition_size] * num_clients
-	# trim trainset to partition_size*num_clients without iloc
-	# trainset = torch.utils.data.Subset(trainset, range(partition_size * num_clients))
-	datasets = random_split(torch.utils.data.Subset(trainset, range(partition_size * num_clients)), lengths, torch.Generator().manual_seed(42))
-	# datasets = random_split(testset[:sum(lengths)], lengths, torch.Generator().manual_seed(42))
-	y_labels = data.columns[-8:]
+	if group_col is not None and group_col in data_images_train.columns:
+		# By-robot/by-room partitioning: each client gets every row of one
+		# unique group value, instead of a blind random_split. Requires
+		# exactly one client per unique group value.
+		groups = sorted(data_images_train[group_col].unique())
+		if len(groups) != num_clients:
+			raise ValueError(
+				f"group_col={group_col!r} has {len(groups)} unique values {groups} "
+				f"but num_clients={num_clients} -- these must match for by-group partitioning.")
+		datasets = [
+			torch.utils.data.Subset(trainset, data_images_train.index[data_images_train[group_col] == g].tolist())
+			for g in groups
+		]
+	else:
+		# Split training set into `num_clients` partitions to simulate different local datasets
+		partition_size = len(trainset) // num_clients
+
+		lengths = [partition_size] * num_clients
+		# trim trainset to partition_size*num_clients without iloc
+		# trainset = torch.utils.data.Subset(trainset, range(partition_size * num_clients))
+		datasets = random_split(torch.utils.data.Subset(trainset, range(partition_size * num_clients)), lengths, torch.Generator().manual_seed(42))
+		# datasets = random_split(testset[:sum(lengths)], lengths, torch.Generator().manual_seed(42))
+	y_labels = action_cols
 	# Split each partition into train/val and create DataLoader
 	trainloaders = []
 	# valloaders = []
-	
+
 	for ds in datasets:
 		# if distil:
 		# 	outputs = pd.DataFrame(predict_gen_distil(teacher_model, DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True), DEVICE))
@@ -164,8 +220,11 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 
 
 def load_datasets_pretrain(num_clients, path, split, aug=True, batch_size=16, out='', DEVICE=torch.device("cpu"),
-						   data_permutation=None):
-	data = load_images(path)
+						   data_permutation=None, action_cols=None, extra_cols=None):
+	action_cols = list(action_cols) if action_cols is not None else list(_DEFAULT_ACTION_COLS)
+	extra_cols = list(extra_cols) if extra_cols is not None else list(_DEFAULT_EXTRA_COLS)
+	label_start = 2 + len(extra_cols)
+	data = load_images(path, action_cols=action_cols, extra_cols=extra_cols)
 	if data_permutation is None:
 		data_permutation = np.random.permutation(len(data))
 	data = data.iloc[data_permutation]
@@ -184,7 +243,7 @@ def load_datasets_pretrain(num_clients, path, split, aug=True, batch_size=16, ou
 		transforms.ToTensor(),
 		transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 	])
-	testset = CustomDataset(dataframe=data_images_test, transform=test_transform)
+	testset = CustomDataset(dataframe=data_images_test, transform=test_transform, label_start=label_start)
 	# Split each partition into train/val and create DataLoader
 	trainloaders = []
 	# valloaders = []
@@ -201,69 +260,97 @@ def ac_split(path):
 	return arrow, circle
 
 
-def task_splitter_circle_arrow(path, n_clients, aug, batch_size=16):
+def task_splitter(path, task_col, task_values, n_clients, aug, batch_size=16,
+				  action_cols=None, extra_cols=None, split_col=None):
+	"""N-task generalization of task_splitter_circle_arrow (see
+	OFFICEDB_MODIFICATIONS.md). task_values is an ordered list of any length;
+	each value selects one task's rows via data[task_col] == value.
+
+	Returns (train_per_task_cl, cumulative_test_per_task, final_test, y_labels):
+	  - train_per_task_cl[t][cid]: this client's DataLoader for task t.
+	  - cumulative_test_per_task[t]: DataLoader over tasks 0..t combined --
+	    generalizes the paper's Task1 -> Combined(Task1+Task2) protocol to N
+	    tasks (evaluate retention vs. catastrophic forgetting after each task
+	    boundary, not just the final one). For the original 2-task case this
+	    reproduces vendor's [test_circle, test] exactly: entry 0 is task 0
+	    alone (nothing precedes it to combine with), entry -1 is all tasks
+	    combined.
+	  - final_test == cumulative_test_per_task[-1] (all tasks combined),
+	    kept separately for callers that just want one combined test loader.
+	"""
+	action_cols = list(action_cols) if action_cols is not None else list(_DEFAULT_ACTION_COLS)
+	extra_cols = list(extra_cols) if extra_cols is not None else list(_DEFAULT_EXTRA_COLS)
+	label_start = 2 + len(extra_cols)
+
 	if aug:
 		train_transform = transforms.Compose([
 			transforms.Resize((128, 128)),
 			transforms.RandomHorizontalFlip(),
 			transforms.RandomRotation(10),
-			# transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-			# transforms.RandomResizedCrop(32, scale=(0.8, 1.0)),
 			transforms.ToTensor(),
 			transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 		])
 	else:
 		train_transform = transforms.Compose([
-			transforms.Resize((128, 128)),  # Adjust the size according to your model requirements
+			transforms.Resize((128, 128)),
 			transforms.ToTensor(),
 			transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 		])
 	test_transform = transforms.Compose([
-		transforms.Resize((128, 128)),  # Adjust the size according to your model requirements
+		transforms.Resize((128, 128)),
 		transforms.ToTensor(),
 		transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 	])
 
-	arrow, circle = ac_split(path)
-	train_arrow_cl = []
-	train_circle_cl = []
+	data = load_images(path, action_cols=action_cols, extra_cols=extra_cols)
+	y_labels = action_cols
 
-	# Label columns
-	y_labels = arrow.columns[-8:]
-	
-	arrow = arrow.sample(frac=1).reset_index(drop=True)
-	circle = circle.sample(frac=1).reset_index(drop=True)
-	
-	test_circle = circle.iloc[int(circle.shape[0] * 0.75):]
-	test_circle = DataLoader(CustomDataset(test_circle, transform=test_transform), batch_size=batch_size, drop_last=True)
+	train_per_task_cl = []
+	cumulative_test = []
+	running_test_frames = []
 
-	test_arrow = arrow.iloc[int(arrow.shape[0] * 0.75):]
-	test_arrow = DataLoader(CustomDataset(test_arrow, transform=test_transform), batch_size=batch_size, drop_last=True)
+	for value in task_values:
+		frame = data[data[task_col] == value].sample(frac=1).reset_index(drop=True)
 
-	test = pd.concat([circle.iloc[int(circle.shape[0] * 0.75):], arrow.iloc[int(arrow.shape[0] * 0.75):]], axis=0)
-	test = test.sample(frac=1).reset_index(drop=True)
-	test = DataLoader(CustomDataset(test, test_transform), batch_size=batch_size, drop_last=True)
+		if split_col is not None and split_col in frame.columns:
+			train_frame = frame[frame[split_col] == 'train'].reset_index(drop=True)
+			test_frame = frame[frame[split_col] == 'test'].reset_index(drop=True)
+		else:
+			n = frame.shape[0]
+			train_frame = frame.iloc[:int(n * 0.75)].reset_index(drop=True)
+			test_frame = frame.iloc[int(n * 0.75):].reset_index(drop=True)
 
-	arrow = arrow.iloc[:int(arrow.shape[0] * 0.75)]
-	circle = circle.iloc[:int(circle.shape[0] * 0.75)]
-	
-	if aug:
-		arrow = load_augmented(arrow)
-		circle = load_augmented(circle)
-		arrow = arrow.sample(frac=1).reset_index(drop=True)
-		circle = circle.sample(frac=1).reset_index(drop=True)
-		
-	size_arrow = int(arrow.shape[0] / n_clients)
-	size_circle = int(circle.shape[0] / n_clients)
-	for i in range(n_clients):
-		train_arrow_cl.append(
-			DataLoader(CustomDataset(arrow.iloc[i * size_arrow:(i + 1) * size_arrow], train_transform), batch_size=batch_size,
-					   shuffle=True, drop_last=True))
-		train_circle_cl.append(
-			DataLoader(CustomDataset(circle.iloc[i * size_circle:(i + 1) * size_circle], train_transform), batch_size=batch_size,
-					   shuffle=True, drop_last=True))
+		running_test_frames.append(test_frame)
+		combined_test = pd.concat(running_test_frames, axis=0).sample(frac=1).reset_index(drop=True)
+		cumulative_test.append(
+			DataLoader(CustomDataset(combined_test, test_transform, label_start=label_start),
+					   batch_size=batch_size, drop_last=True))
 
-	return [train_circle_cl, train_arrow_cl], [test_circle, test_arrow], test, y_labels
+		if aug:
+			train_frame = load_augmented(train_frame)
+			train_frame = train_frame.sample(frac=1).reset_index(drop=True)
+
+		size = train_frame.shape[0] // n_clients
+		client_loaders = []
+		for i in range(n_clients):
+			chunk = train_frame.iloc[i * size:(i + 1) * size]
+			client_loaders.append(
+				DataLoader(CustomDataset(chunk, train_transform, label_start=label_start), batch_size=batch_size,
+						   shuffle=True, drop_last=True))
+		train_per_task_cl.append(client_loaders)
+
+	final_test = cumulative_test[-1]
+	return train_per_task_cl, cumulative_test, final_test, y_labels
+
+
+def task_splitter_circle_arrow(path, n_clients, aug, batch_size=16):
+	"""Backward-compatible wrapper reproducing vendor's original 2-task
+	circle/arrow split via the generalized task_splitter above (see
+	OFFICEDB_MODIFICATIONS.md). 'Using circle' and 'Using arrow' are
+	complementary flags on every row (circle=1,arrow=0 or circle=0,arrow=1),
+	so task_values=[1, 0] on 'Using circle' reproduces [circle-task,
+	arrow-task] exactly."""
+	return task_splitter(path, task_col='Using circle', task_values=[1, 0], n_clients=n_clients, aug=aug, batch_size=batch_size)
 
 
 def load_datasets_hyper(path, aug):

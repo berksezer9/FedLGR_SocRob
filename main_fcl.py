@@ -4,7 +4,7 @@ from CL.default import EWC
 from client.default import FlowerClientCL, FlowerClient_NR
 from client.fedRoot import FlowerClientCL_Root, FlowerClient_NR_Root, FlowerClient_LGR
 from models.GenNet import VAE
-from dataloader.utils import task_splitter_circle_arrow
+from dataloader.utils import task_splitter
 from server.strategies import FedAvgWithAccuracyMetric
 import ray
 import flwr as fl
@@ -27,9 +27,12 @@ warnings.filterwarnings("ignore")
 
 
 def run_strategy(strategy, strategy_name, coeff, client_fn, clients, rounds, epochs, output, aug, ray_init_args,
-                 client_res):
+                 client_res, n_tasks=2):
+    # Generalizes vendor's original hardcoded 2-task Loss1/RMSE1/PCC1/Loss2/RMSE2/PCC2
+    # columns to N task-boundary columns (see OFFICEDB_MODIFICATIONS.md). For
+    # n_tasks=2 this produces the identical column set/values as before.
     print("Running strategy " + str(strategy_name) + " for " + str(clients) + "clients!")
-    
+
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=int(clients),
@@ -38,20 +41,28 @@ def run_strategy(strategy, strategy_name, coeff, client_fn, clients, rounds, epo
         ray_init_args=ray_init_args,
         client_resources=client_res,
     )
+    rounds_per_task = int(rounds) // n_tasks
+    # server_round number of each task's final round (1-indexed, matches Flower's config["server_round"])
+    task_rounds = [rounds_per_task * k for k in range(1, n_tasks + 1)]
+    metric_cols = []
+    for t in range(1, n_tasks + 1):
+        metric_cols += [f"Loss{t}", f"RMSE{t}", f"PCC{t}"]
+
     try:
         data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
         data.drop(["Unnamed: 0"], axis=1, inplace=True)
     except:
-        data = pd.DataFrame(columns=["Method", "reg_coeff", "Loss1", "RMSE1", "PCC1", "Loss2", "RMSE2", "PCC2"])
-    
-    data = pd.concat(
-        [data, pd.Series([f"{strategy_name}", f"{coeff}", truncate_float(history.losses_distributed[int(rounds / 2) - 1][-1],4),
-                            truncate_float(history.metrics_distributed['avg_rmse'][int(rounds / 2) - 1][-1],4),
-                            truncate_float(history.metrics_distributed['avg_pearson_score'][int(rounds / 2) - 1][-1],4),
-                            truncate_float(history.losses_distributed[-1][-1],4),
-                            truncate_float(history.metrics_distributed['avg_rmse'][-1][-1],4),
-                            truncate_float(history.metrics_distributed['avg_pearson_score'][-1][-1],4)], index=data.columns).to_frame().T])
-    
+        data = pd.DataFrame(columns=["Method", "reg_coeff"] + metric_cols)
+
+    row = [f"{strategy_name}", f"{coeff}"]
+    for r in task_rounds:
+        # losses_distributed/metrics_distributed are 0-indexed per completed round (round 1 -> index 0)
+        idx = r - 1
+        row += [truncate_float(history.losses_distributed[idx][-1], 4),
+                truncate_float(history.metrics_distributed['avg_rmse'][idx][-1], 4),
+                truncate_float(history.metrics_distributed['avg_pearson_score'][idx][-1], 4)]
+    data = pd.concat([data, pd.Series(row, index=data.columns).to_frame().T])
+
     data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
 
     try:
@@ -59,16 +70,16 @@ def run_strategy(strategy, strategy_name, coeff, client_fn, clients, rounds, epo
             data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
             data.drop(["Unnamed: 0"], axis=1, inplace=True)
         except:
-            data = pd.DataFrame(columns=["Method", "reg_coeff", "Loss1", "RMSE1", "PCC1", "Loss2", "RMSE2", "PCC2"])
-        
-        data = pd.concat(
-            [data, pd.Series([f"{strategy_name}", f"{coeff}", truncate_float(history.losses_centralized[int(rounds / 2)][-1],4),
-                                truncate_float(history.metrics_centralized['avg_rmse'][int(rounds / 2)][-1],4),
-                                truncate_float(history.metrics_centralized['avg_pearson_score'][int(rounds / 2)][-1],4),
-                                truncate_float(history.losses_centralized[-1][-1],4),
-                                truncate_float(history.metrics_centralized['avg_rmse'][-1][-1],4),
-                                truncate_float(history.metrics_centralized['avg_pearson_score'][-1][-1],4)],
-                             index=data.columns).to_frame().T])
+            data = pd.DataFrame(columns=["Method", "reg_coeff"] + metric_cols)
+
+        row = [f"{strategy_name}", f"{coeff}"]
+        for r in task_rounds:
+            # losses_centralized/metrics_centralized include an initial round-0
+            # evaluation (before training) at index 0, so round r sits at index r.
+            row += [truncate_float(history.losses_centralized[r][-1], 4),
+                    truncate_float(history.metrics_centralized['avg_rmse'][r][-1], 4),
+                    truncate_float(history.metrics_centralized['avg_pearson_score'][r][-1], 4)]
+        data = pd.concat([data, pd.Series(row, index=data.columns).to_frame().T])
         data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
 
     except:
@@ -104,40 +115,53 @@ def run(args):
                               testloader=testloader, epochs=int(args.epochs),
                               y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                               path=f"{output_reg}",
-                              DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params)
+                              DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
 
     def client_fn_NR(cid) -> FlowerClient_NR:
         return FlowerClient_NR(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                testloader=testloader, epochs=int(args.epochs),
                                y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                path=f"{output_NR}",
-                               DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params)
+                               DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
 
     def client_fn_reg_root(cid) -> FlowerClientCL_Root:
         return FlowerClientCL_Root(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                    testloader=testloader, epochs=int(args.epochs),
                                    y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                    path=f"{output_root_reg}",
-                                   DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params)
+                                   DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
 
     def client_fn_NR_root(cid) -> FlowerClient_NR_Root:
         return FlowerClient_NR_Root(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                     testloader=testloader, epochs=int(args.epochs),
                                     y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                     path=f"{output_root_NR}",
-                                    DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params)
+                                    DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
 
     def client_fn_LGR(cid) -> FlowerClient_LGR:
         return FlowerClient_LGR(cid, net=net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                 testloader=testloader, gr=gr.to(DEVICE), epochs=int(args.epochs),
                                 y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                 path=f"{output}",
-                                DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params)
+                                DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
 
     if args.model == 'MobileNet':
         from models.MobileNet import Net
     elif args.model == 'DeepLabMobileNet':
         from models.deepLabMobileNet import Net
+
+    # None (default) reproduces vendor's original MANNERS-DB column names/2-task
+    # circle-arrow split; comma-separated CLI values override them for OfficeDB's
+    # Axis A/B task splits (see OFFICEDB_MODIFICATIONS.md).
+    action_cols = args.action_cols.split(',') if args.action_cols else None
+    extra_cols = args.extra_cols.split(',') if args.extra_cols else None
+
+    def _coerce(v):
+        try:
+            return float(v)
+        except ValueError:
+            return v
+    task_values = [_coerce(v) for v in args.task_values.split(',')] if args.task_values else [1, 0]
 
     # make a directory in the output folder with name "YYMMDD_HHMMSS" followed by the arguments
     experiment_path = f"{args.output}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.strategy_fl}_{args.strategy_cl}_{args.model}_{args.rounds}_{args.icl}_{args.fcl}_{args.aug}_{args.processor_type}"
@@ -167,7 +191,7 @@ def run(args):
 
     # Running the loop for clients between icl (low) and fcl (high)
     for n_cl in range(int(args.icl), int(args.fcl) + 1):
-        net = Net()
+        net = Net(num_classes=args.num_classes)
         params = get_parameters(net)
         if gpu_flag == 1:
             client_res = {"num_gpus": num_GPUs / n_cl, "num_cpus": num_CPUs}
@@ -177,8 +201,10 @@ def run(args):
         if not os.path.exists(f"{args.output}/{n_cl}"):
             os.mkdir(f"{args.output}/{n_cl}")
 
-        trainloaders, valloaders, testloader, y_labels = task_splitter_circle_arrow(path=args.path, n_clients=n_cl, aug=args.aug, batch_size=args.batch_size)
-        
+        trainloaders, valloaders, testloader, y_labels = task_splitter(
+            path=args.path, task_col=args.task_col, task_values=task_values, n_clients=n_cl, aug=args.aug,
+            batch_size=args.batch_size, action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col)
+
 
         if args.strategy_fl == 'all':
             strategies = ['FedAvg', 'FedRoot']
@@ -218,7 +244,7 @@ def run(args):
                             agent_config = {'lr': 0.001, 'momentum': 0.1, 'weight_decay': 0.01,
                                             'schedule': [int(args.epochs)],
                                             'model_type': 'mode', 'model_name': 'model', 'model_weights': '',
-                                            'out_dim': {'All': 8},
+                                            'out_dim': {'All': args.num_classes},
                                             'optimizer': 'Adam', 'print_freq': 0, 'gpuid': [gpu_flag],
                                             'reg_coef': coeff}
 
@@ -237,7 +263,8 @@ def run(args):
                                 initial_parameters=fl.common.ndarrays_to_parameters(params),
                                 on_fit_config_fn=fit_config,
                                 on_evaluate_config_fn=evaluate_config,
-                                evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels)
+                                evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels,
+                                                            rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks)
                             )
                             
                             rambef = ramu.compute("BEFORE EVALUATION")
@@ -250,7 +277,7 @@ def run(args):
                             run_strategy(strategy=strategy, strategy_name=f"{strat_cl}", coeff=coeff,
                                          client_fn=client_fn, clients=n_cl, rounds=int(args.rounds),
                                          epochs=int(args.epochs), output=f"{output}", aug=args.aug,
-                                         ray_init_args=ray_init_args, client_res=client_res)
+                                         ray_init_args=ray_init_args, client_res=client_res, n_tasks=args.n_tasks)
                             
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
@@ -274,7 +301,7 @@ def run(args):
                             agent_config = {'lr': 0.001, 'momentum': 0.1, 'weight_decay': 0.01,
                                             'schedule': [int(args.epochs)],
                                             'model_type': 'mode', 'model_name': 'model', 'model_weights': '',
-                                            'out_dim': {'All': 8},
+                                            'out_dim': {'All': args.num_classes},
                                             'optimizer': 'Adam', 'print_freq': 0, 'gpuid': [gpu_flag],
                                             'memory_size': buffer_size, 'reg_coef': 0.01}
                             caller = NR
@@ -285,7 +312,8 @@ def run(args):
                                 initial_parameters=fl.common.ndarrays_to_parameters(params),
                                 on_fit_config_fn=fit_config,
                                 on_evaluate_config_fn=evaluate_config,
-                                evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels)
+                                evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels,
+                                                            rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks)
 
                             )
                             rambef = ramu.compute("BEFORE EVALUATION")
@@ -296,7 +324,7 @@ def run(args):
                                 gpubeff = 0
                             run_strategy(strategy, f"{strat_cl}", buffer_size, client_fn, n_cl, int(args.rounds),
                                          int(args.epochs),
-                                         f"{output}", args.aug, ray_init_args, client_res)
+                                         f"{output}", args.aug, ray_init_args, client_res, args.n_tasks)
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
                             if gpu_flag == 1:
@@ -326,7 +354,7 @@ def run(args):
                             agent_config = {'lr': 0.0001, 'momentum': 0.1, 'weight_decay': 0.01,
                                             'schedule': [int(args.epochs)],
                                             'model_type': 'mode', 'model_name': 'model', 'model_weights': '',
-                                            'out_dim': {'All': 8}, 'optimizer':
+                                            'out_dim': {'All': args.num_classes}, 'optimizer':
                                                 'Adam', 'print_freq': 0, 'gpuid': [gpu_flag], 'reg_coef': coeff}
                             if strat_cl == 'EWC':
                                 caller = EWC
@@ -352,7 +380,7 @@ def run(args):
                             run_strategy(strategy=strategy, strategy_name=f"{strat_cl}", coeff=coeff,
                                          client_fn=client_fn, clients=n_cl, rounds=int(args.rounds),
                                          epochs=int(args.epochs), output=f"{output}", aug=args.aug,
-                                         ray_init_args=ray_init_args, client_res=client_res)
+                                         ray_init_args=ray_init_args, client_res=client_res, n_tasks=args.n_tasks)
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
                             if gpu_flag == 1:
@@ -372,7 +400,7 @@ def run(args):
                             agent_config = {'lr': 0.0001, 'momentum': 0.1, 'weight_decay': 0.01,
                                             'schedule': [int(args.epochs)],
                                             'model_type': 'mode', 'model_name': 'model', 'model_weights': '',
-                                            'out_dim': {'All': 8},
+                                            'out_dim': {'All': args.num_classes},
                                             'optimizer': 'Adam', 'print_freq': 0, 'gpuid': [gpu_flag],
                                             'memory_size': buffer_size, 'reg_coef': 0.01}
                             caller = NR
@@ -394,7 +422,7 @@ def run(args):
                                 gpubeff = 0
                             run_strategy(strategy, f"{strat_cl}", buffer_size, client_fn, n_cl, int(args.rounds),
                                          int(args.epochs),
-                                         f"{output}", args.aug, ray_init_args, client_res)
+                                         f"{output}", args.aug, ray_init_args, client_res, args.n_tasks)
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
                             if gpu_flag == 1:
@@ -406,7 +434,7 @@ def run(args):
                         agent_config = {'lr': 0.001, 'momentum': 0.1, 'weight_decay': 0.01,
                                         'schedule': [int(args.epochs)],
                                         'model_type': 'mode', 'model_name': 'model', 'model_weights': '',
-                                        'out_dim': {'All': 8},
+                                        'out_dim': {'All': args.num_classes},
                                         'optimizer': 'Adam', 'print_freq': 0, 'gpuid': [gpu_flag], 'reg_coef': 0.01}
 
                         caller = LatentGenerativeReplay
@@ -414,24 +442,28 @@ def run(args):
                         output_root_LGR = f"{output}/{strat_cl}"
                         if not os.path.exists(output_root_LGR):
                             os.mkdir(f"{output_root_LGR}")
+                        # pretrained_dir defaults to 'models', reproducing the
+                        # original cwd-relative path exactly; OfficeDB adaptation
+                        # passes --pretrained_dir so this doesn't depend on cwd
+                        # (see OFFICEDB_MODIFICATIONS.md).
                         if args.model == 'MobileNet':
                             input_dim = 1280  # Replace with the size of your input data
                             if gpu_flag == 1:
-                                with open('models/gpu/MobileNet.pkl', 'rb') as f:
+                                with open(f'{args.pretrained_dir}/gpu/MobileNet.pkl', 'rb') as f:
                                     net.load_state_dict(pickle.load(f), strict=True)
                                 print("-------------------Loaded pretrained MobileNet for GPU-------------------")
                             else:
-                                with open('models/cpu/MobileNet.pkl', 'rb') as f:
+                                with open(f'{args.pretrained_dir}/cpu/MobileNet.pkl', 'rb') as f:
                                     net.load_state_dict(pickle.load(f), strict=True)
                                 print("-------------------Loaded pretrained MobileNet for CPU-------------------")
                         elif args.model == 'DeepLabMobileNet':
                             input_dim = 1344
                             if gpu_flag == 1:
-                                with open('models/gpu/DeepLabMobileNet.pkl', 'rb') as f:
+                                with open(f'{args.pretrained_dir}/gpu/DeepLabMobileNet.pkl', 'rb') as f:
                                     net.load_state_dict(pickle.load(f), strict=True)
                                 print("-------------------Loaded pretrained DeepLabMobileNet for GPU-------------------")
                             else:
-                                with open('models/cpu/DeepLabMobileNet.pkl', 'rb') as f:
+                                with open(f'{args.pretrained_dir}/cpu/DeepLabMobileNet.pkl', 'rb') as f:
                                     net.load_state_dict(pickle.load(f), strict=True)
                                 print("-------------------Loaded pretrained DeepLabMobileNet for CPU-------------------")
                         # params = get_parameters(net.conv_module)
@@ -456,7 +488,7 @@ def run(args):
                             gpubeff = 0
                         run_strategy(strategy, f"{strat_cl}", 'LGR', client_fn, n_cl, int(args.rounds),
                                      int(args.epochs),
-                                     f"{output}", args.aug, ray_init_args, client_res)
+                                     f"{output}", args.aug, ray_init_args, client_res, args.n_tasks)
                         ramaf = ramu.compute("AFTER EVALUATION")
                         cpuaf = cpuu.compute("AFTER EVALUATION")
                         if gpu_flag == 1:
@@ -488,6 +520,14 @@ if __name__ == "__main__":
     parser.add_argument("-a", "--aug", type=eval, choices=[True, False], default='False', help="Use Augmentation?")
     parser.add_argument("-b", "--base", type=str, default="FedAvg", help="Default base for FedRoot Only")
     parser.add_argument("-t", "--processor_type", type=str, default="cpu", help="Processor Type")
+    parser.add_argument("--num_classes", type=int, default=8, help="Number of action output heads (8=MANNERS-DB, 9=OfficeDB)")
+    parser.add_argument("--n_tasks", type=int, default=2, help="Number of sequential FCL tasks (2=MANNERS-DB circle/arrow, 3=OfficeDB Axis A, 6=OfficeDB Axis B); rounds must be divisible by n_tasks")
+    parser.add_argument("--task_col", type=str, default="Using circle", help="Column whose values define task membership")
+    parser.add_argument("--task_values", type=str, default=None, help="Comma-separated ordered task values matching --task_col (default: '1,0', i.e. circle then arrow)")
+    parser.add_argument("--pretrained_dir", type=str, default="models", help="Directory holding {cpu,gpu}/<model>.pkl pretrained checkpoints for LGR (was a bare cwd-relative 'models' path)")
+    parser.add_argument("--action_cols", type=str, default=None, help="Comma-separated action column names (default: MANNERS-DB's 8 hardcoded names)")
+    parser.add_argument("--extra_cols", type=str, default=None, help="Comma-separated pass-through id columns, e.g. group/task/split columns (default: 'Using circle,Using arrow')")
+    parser.add_argument("--split_col", type=str, default=None, help="Column with pre-computed train/test labels, used instead of the internal random 75/25 split per task")
     args = parser.parse_args()
 
     print("Running with the following arguments:")

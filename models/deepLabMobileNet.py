@@ -40,10 +40,12 @@ class conv(nn.Module):
 
 
 class Net(nn.Module):
-	def __init__(self):
+	def __init__(self, num_classes=8):
+		# num_classes=8 reproduces original MANNERS-DB behaviour; OfficeDB
+		# adaptation passes num_classes=9 (see OFFICEDB_MODIFICATIONS.md).
 		super(Net, self).__init__()
 		self.conv_module = conv()
-		self.fc_module = FCNet(num_classes=8)
+		self.fc_module = FCNet(num_classes=num_classes)
 	
 	def forward(self, x):
 		x = self.conv_module(x)

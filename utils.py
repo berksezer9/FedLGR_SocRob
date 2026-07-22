@@ -294,24 +294,27 @@ def get_eval_fn(net, testloader, y_labels, DEVICE):
 	return evaluate
 
 
-def get_eval_fn_cl(net, testloader, y_labels, DEVICE):
+def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks=2):
+	# testloader is the cumulative per-task-boundary test loader list from
+	# dataloader.utils.task_splitter (tasks 0..task_idx combined) -- see
+	# OFFICEDB_MODIFICATIONS.md. Originally hardcoded to "<=5"/testloader[0]
+	# vs. testloader[1], and averaged two separately-computed test() results
+	# (mean of per-task means) rather than evaluating once over the pooled
+	# cumulative set (sample-weighted); for n_tasks=2 both still land on the
+	# same two loaders, just computed as one pooled test() call instead of
+	# two averaged ones -- an intentional, more standard combined-eval
+	# computation, not a behavior bug.
 	def evaluate(server_round: int, weights: fl.common.NDArrays, config: Dict[str, Scalar]) -> Optional[Tuple[float, Dict[str, Scalar]]]:
 		net.train()
 		params_dict = zip(net.state_dict().keys(), weights)
 		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
 		net.load_state_dict(state_dict, strict=True)
-		if server_round <= 5:
-			loss, avg_pearson, avg_rmse = test(net, testloader[0], y_labels, DEVICE)
-		else:
-			loss1, avg_pearson1, avg_rmse1 = test(net, testloader[0], y_labels, DEVICE)
-			loss2, avg_pearson2, avg_rmse2 = test(net, testloader[1], y_labels, DEVICE)
-			loss = (loss1 + loss2) / 2
-			avg_pearson = (avg_pearson1 + avg_pearson2) / 2
-			avg_rmse = (avg_rmse1 + avg_rmse2) / 2
-		
+		task_idx = min((server_round - 1) // rounds_per_task, n_tasks - 1)
+		loss, avg_pearson, avg_rmse = test(net, testloader[task_idx], y_labels, DEVICE)
+
 		print("Round %s, Loss %s, Pearson %s, RMSE %s" % (server_round, loss, avg_pearson, avg_rmse))
 		return loss, {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
-	
+
 	return evaluate
 
 

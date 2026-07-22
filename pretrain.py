@@ -24,21 +24,25 @@ def run(args):
         gpu = True
 
     if args.models == 'all':
-        models=[deepNet(), mobNet()]
+        models=[deepNet(num_classes=args.num_classes), mobNet(num_classes=args.num_classes)]
         names=['DeepLabMobileNet', 'MobileNet']
     elif args.models == 'DeepLabMobileNet':
-        models=[deepNet()]
+        models=[deepNet(num_classes=args.num_classes)]
         names=['DeepLabMobileNet']
     elif args.models == 'MobileNet':
-        models=[mobNet()]
+        models=[mobNet(num_classes=args.num_classes)]
         names=['MobileNet']
 
-    data=load_datasets_pretrain(num_clients=1, split= args.split_ratio, batch_size=args.batch_size, path=args.data, aug=False, DEVICE=DEVICE)
+    # action_cols=None (default) reproduces MANNERS-DB's 8 hardcoded action
+    # names; OfficeDB adaptation passes --action_cols (see OFFICEDB_MODIFICATIONS.md).
+    action_cols = args.action_cols.split(',') if args.action_cols else None
+    data=load_datasets_pretrain(num_clients=1, split= args.split_ratio, batch_size=args.batch_size, path=args.data, aug=False, DEVICE=DEVICE,
+                                 action_cols=action_cols)
     for i in range(len(models)):
         model=models[i]
         model_n=names[i]
         train(model=model, train_loader=data, epochs=args.epochs, DEVICE=DEVICE)
-        y_labels=[0,1,2,3,4,5,6,7]
+        y_labels=list(range(args.num_classes))
         a,b,c=test(net=model, testloader=data,y_labels=y_labels, DEVICE=DEVICE)
         print(a, b, c)
         with open(args.path + "/" + model_n + ".pkl", 'wb') as f:
@@ -61,6 +65,8 @@ if __name__ == "__main__":
     parser.add_argument('-p', '--path', type=str, default='models', help='Path to save the model')
     #processor
     parser.add_argument('-t', '--processor', type=str, default='cpu', help='Processor to run the scrip')
+    parser.add_argument('--num_classes', type=int, default=8, help='Number of action output heads (8=MANNERS-DB, 9=OfficeDB)')
+    parser.add_argument('--action_cols', type=str, default=None, help='Comma-separated action column names (default: MANNERS-DB\'s 8 hardcoded names)')
     args = parser.parse_args()
 
     print("Running with following arguments:")

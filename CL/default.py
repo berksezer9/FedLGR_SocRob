@@ -149,7 +149,10 @@ class NormalNN(nn.Module):
 			self.log('Optimizer is reset!')
 			self.init_optimizer()
 		
-		y_labels = [0, 1, 2, 3, 4, 5, 6, 7]
+		# Was hardcoded to 8 action indices; derives from configured out_dim so
+		# per-epoch PCC logging covers all of OfficeDB's 9 actions too (this
+		# only affects the debug log, not training/final reported metrics).
+		y_labels = list(range(self.config['out_dim']['All']))
 		
 		for epoch in range(self.config['schedule'][-1]):
 			data_timer = Timer()
@@ -898,11 +901,16 @@ class LatentGenerativeReplay(nn.Module):
 		return new_data_loader
 	
 	def create_dataset(self, new_data):
+		# Cache key includes task_count (not just client_id): vendor's
+		# original filename was fixed-per-client, so after the first task
+		# boundary it kept serving a stale pseudo-replay set generated from
+		# an earlier generator state -- invisible with only 2 tasks (one
+		# boundary ever occurs) but wrong for N>2 (see OFFICEDB_MODIFICATIONS.md).
 		try:
-			current_task_reconstucted_data = torch.load(f'{self.path}/{self.client_id}_current_task_reconstucted_data.pth')
+			current_task_reconstucted_data = torch.load(f'{self.path}/{self.client_id}_{self.task_count}_current_task_reconstucted_data.pth')
 		except:
 			current_task_reconstucted_data = self.predict_from_gen(self.generator, num_samples=len(new_data) * 16, DEVICE=self.Device, batch_size=16)
-			torch.save(current_task_reconstucted_data, f'{self.path}/{self.client_id}_current_task_reconstucted_data.pth')
+			torch.save(current_task_reconstucted_data, f'{self.path}/{self.client_id}_{self.task_count}_current_task_reconstucted_data.pth')
 		# shuffle it with train_loader and return
 		# both are dataloaders
 		dataset1 = new_data.dataset
@@ -924,12 +932,14 @@ class LatentGenerativeReplay(nn.Module):
 		return combined_dataloader
 	
 	def create_dataset_gen(self, new_data):
+		# See create_dataset above: cache key includes task_count to avoid
+		# serving a stale pseudo-replay set across task boundaries (N>2).
 		try:
-			current_task_reconstucted_data = torch.load(f'{self.path}/{self.client_id}_current_task_reconstucted_data_generator.pth')
+			current_task_reconstucted_data = torch.load(f'{self.path}/{self.client_id}_{self.task_count}_current_task_reconstucted_data_generator.pth')
 		except:
 			current_task_reconstucted_data = self.predict_from_gen_gen(self.generator, num_samples=len(new_data) * 16, DEVICE=self.Device,
 			                                                           batch_size=16)
-			torch.save(current_task_reconstucted_data, f'{self.path}/{self.client_id}_current_task_reconstucted_data_generator.pth')
+			torch.save(current_task_reconstucted_data, f'{self.path}/{self.client_id}_{self.task_count}_current_task_reconstucted_data_generator.pth')
 		# shuffle it with train_loader and return
 		# both are dataloaders
 		dataset1 = new_data.dataset
