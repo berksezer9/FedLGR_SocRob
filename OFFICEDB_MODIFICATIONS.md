@@ -172,10 +172,17 @@ Pre-existing vendor bug, unrelated to the FCL generalization above.
   (replaced by the new SuperLink/ServerApp/ClientApp architecture, a rewrite this repo does
   not use).
 - Dropped `tensorflow`/`tensorflow-estimator`/`tensorflow-gpu`/`tensorflow-io-gcs-filesystem`/
-  `tensorflow-probability` and both `opencv-python`/`opencv-python-headless` lines — grepped
-  the codebase (`grep -rn "tensorflow\|opencv\|cv2"`) and confirmed none of them are imported
+  `tensorflow-probability`, both `opencv-python`/`opencv-python-headless` lines, and
+  `tensorboard`/`tensorboard-data-server`/`tensorboard-plugin-wit` — grepped the codebase
+  (`grep -rn "tensorflow\|opencv\|cv2\|tensorboard"`) and confirmed none of them are imported
   anywhere; this implementation is entirely PyTorch-based (mirrors the root README's existing
-  macOS-setup precedent of dropping the same `tensorflow*` lines for the same reason).
+  macOS-setup precedent of dropping the same `tensorflow*` lines for the same reason). The
+  `tensorboard==2.11.2` pin also turned out to be a genuine install blocker, not just dead
+  weight: it requires `protobuf<4`, while `flwr==1.12.0` requires `protobuf>=4.25.2` —
+  unresolvable together even ignoring the "unused" argument.
+- Unpinned `grpcio` (was `==1.51.3`): `flwr==1.12.0` requires `grpcio>=1.60.0,<1.65.1` (or
+  `>1.66.1`), incompatible with the original pin. Left unpinned rather than re-pinned, since
+  the exact patch version doesn't matter here — let `flwr`'s own dependency resolution pick one.
 
 ## Not changed
 
