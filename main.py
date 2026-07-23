@@ -159,6 +159,14 @@ def run(args):
         ray_init_args = {"num_gpus": num_GPUs, "num_cpus": num_CPUs}
         DEVICE = torch.device("cpu")
         gpu_flag = 0
+    # Ray defaults its temp dir to /tmp/ray -- on a shared Wilkes3 GPU node
+    # /tmp is node-local but can already be owned by another user's leftover
+    # Ray session, surfacing as a PermissionError on
+    # /tmp/ray/ray_current_cluster. RAY_TMPDIR (set by the calling sbatch
+    # script/smoke test, not a Ray-native env var) lets that be overridden
+    # without hardcoding a path here.
+    if os.environ.get("RAY_TMPDIR"):
+        ray_init_args["_temp_dir"] = os.environ["RAY_TMPDIR"]
 
     # Initial RAM and CPU Usage.
     ramu = RAMU()

@@ -60,6 +60,12 @@ class NormalNN(nn.Module):
 		self.reset_optimizer = False
 		self.valid_out_dim = 'ALL'  # Default: 'ALL' means all output nodes are active
 		self.criterion_rmse = RMSELoss()
+		# FCL Axis A (action-subset) column masking: set by the client wrapper
+		# (client/default.py, client/fedRoot.py) to this task's active output
+		# indices before learn_batch()/criterion() calls; None (default)
+		# reproduces the original full-9/8-dim loss exactly. See
+		# OFFICEDB_MODIFICATIONS.md.
+		self.active_idx = None
 	
 	# Set a interger here for the incremental class scenario
 	
@@ -129,6 +135,13 @@ class NormalNN(nn.Module):
 		return acc.avg
 	
 	def criterion(self, preds, targets, **kwargs):
+		# FCL Axis A masking: L2/EWC/EWCOnline/SI/MAS/Naive_Rehearsal all reach
+		# this base implementation (L2.criterion calls super().criterion() for
+		# the task-loss term before adding its own regularization) -- masking
+		# here covers every one of them without touching their own code.
+		if self.active_idx is not None:
+			preds = preds[:, self.active_idx]
+			targets = targets[:, self.active_idx]
 		loss = self.criterion_fn(preds, targets)
 		return loss
 	
@@ -212,6 +225,10 @@ class NormalNN(nn.Module):
 		return peak_ram
 	
 	def test(self, test_loader):
+		# Not on main_fcl.py's evaluation path (it always calls the
+		# module-level utils.test() instead, via get_eval_fn_cl / the client
+		# wrapper classes' evaluate() -- see OFFICEDB_MODIFICATIONS.md) --
+		# left unmasked/untouched deliberately, not an oversight.
 		# loss, rmse, pearson
 		losses = AverageMeter()
 		pcc = AverageMeter()
@@ -715,7 +732,13 @@ class MAS(L2):
 				target = target.cuda()
 			
 			preds = self.forward(inputs)
-			
+			# FCL Axis A masking: MAS's importance is label-free (output
+			# sensitivity, not loss w.r.t. targets) so it doesn't go through
+			# criterion() -- mask directly here so importance isn't computed
+			# over action columns this task hasn't revealed yet.
+			if self.active_idx is not None:
+				preds = preds[:, self.active_idx]
+
 			preds.pow_(2)
 			loss = preds.mean()
 			
@@ -805,15 +828,27 @@ class LatentGenerativeReplay(nn.Module):
 			self.cuda()
 		self.reset_optimizer = False
 		self.valid_out_dim = 'ALL'  # Default: 'ALL' means all output nodes are active
-		self.criterion = nn.MSELoss()
-		# self.criterion = nn.L1Loss()
 		self.path = path
 		self.client_id = client_id
-	
+		# FCL Axis A masking: see NormalNN.active_idx (OFFICEDB_MODIFICATIONS.md).
+		# Was previously `self.criterion = nn.MSELoss()` -- a plain instance
+		# attribute shadowing any method of the same name, which made masking
+		# impossible without touching every call site individually. Replaced
+		# with the criterion() method below (uses self.criterion_fn, already
+		# set above) so masking only needs to happen in one place; behaviour
+		# is identical to the original when active_idx is None.
+		self.active_idx = None
+
+	def criterion(self, preds, targets, **kwargs):
+		if self.active_idx is not None:
+			preds = preds[:, self.active_idx]
+			targets = targets[:, self.active_idx]
+		return self.criterion_fn(preds, targets)
+
 	# Set a interger here for the incremental class scenario
 	def get_generator_weights(self):
 		return self.generator.state_dict()
-	
+
 	def update_model(self, inputs, targets):
 		# self.model=copy.deepcopy(model_)
 		out = self.forward(inputs)

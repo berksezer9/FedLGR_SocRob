@@ -91,7 +91,7 @@ class FlowerClient_Root(fl.client.NumPyClient):
 
 class FlowerClientCL_Root(fl.client.NumPyClient):
 	def __init__(self, cid, net, trainloader, valloader, testloader, epochs, y_labels, cl_strategy, agent_config, nrounds, path, DEVICE, num_clients,
-	             strat_name, params, n_tasks=2):
+	             strat_name, params, n_tasks=2, active_idx_per_task=None, cumulative_idx_per_task=None):
 		self.cid = cid
 		# self.net = net
 		self.trainloaders = trainloader
@@ -109,6 +109,9 @@ class FlowerClientCL_Root(fl.client.NumPyClient):
 		# (OFFICEDB_MODIFICATIONS.md).
 		self.n_tasks = n_tasks
 		self.rounds_per_task = self.nrounds // n_tasks
+		# FCL Axis A masking -- see client/default.py:FlowerClientCL.
+		self.active_idx_per_task = active_idx_per_task
+		self.cumulative_idx_per_task = cumulative_idx_per_task
 
 	def _task_idx(self, server_round):
 		return min((server_round - 1) // self.rounds_per_task, self.n_tasks - 1)
@@ -181,6 +184,8 @@ class FlowerClientCL_Root(fl.client.NumPyClient):
 		server_round = config["server_round"]
 		task_idx = self._task_idx(server_round)
 		train_loader = self.trainloaders[task_idx][int(self.cid)]
+		if self.active_idx_per_task is not None:
+			self.strat.active_idx = self.active_idx_per_task[task_idx]
 
 		if self._is_boundary(server_round, task_idx):
 			task_count += 1
@@ -218,8 +223,14 @@ class FlowerClientCL_Root(fl.client.NumPyClient):
 			self.set_parameters_fc(state_dict)
 		except:
 			print('')
-		eval_loader = self.valloader[self._task_idx(config["server_round"])]
-		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, self.y_labels, self.DEVICE)
+		task_idx = self._task_idx(config["server_round"])
+		eval_loader = self.valloader[task_idx]
+		if self.cumulative_idx_per_task is not None:
+			active_idx = self.cumulative_idx_per_task[task_idx]
+			y_labels = [self.y_labels[i] for i in active_idx]
+		else:
+			active_idx, y_labels = None, self.y_labels
+		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
@@ -228,7 +239,7 @@ class FlowerClientCL_Root(fl.client.NumPyClient):
 
 class FlowerClient_NR_Root(fl.client.NumPyClient):
 	def __init__(self, cid, net, trainloader, valloader, testloader, epochs, y_labels, cl_strategy, agent_config, nrounds, path, DEVICE, num_clients,
-	             strat_name, params, n_tasks=2):
+	             strat_name, params, n_tasks=2, active_idx_per_task=None, cumulative_idx_per_task=None):
 		self.cid = cid
 		# self.net = net
 		self.trainloaders = trainloader
@@ -247,6 +258,9 @@ class FlowerClient_NR_Root(fl.client.NumPyClient):
 		# (OFFICEDB_MODIFICATIONS.md).
 		self.n_tasks = n_tasks
 		self.rounds_per_task = self.nrounds // n_tasks
+		# FCL Axis A masking -- see client/default.py:FlowerClientCL.
+		self.active_idx_per_task = active_idx_per_task
+		self.cumulative_idx_per_task = cumulative_idx_per_task
 
 	def _task_idx(self, server_round):
 		return min((server_round - 1) // self.rounds_per_task, self.n_tasks - 1)
@@ -302,6 +316,8 @@ class FlowerClient_NR_Root(fl.client.NumPyClient):
 		task_idx = self._task_idx(server_round)
 		train_loader = self.trainloaders[task_idx][int(self.cid)]
 		is_boundary = self._is_boundary(server_round, task_idx)
+		if self.active_idx_per_task is not None:
+			self.strat.active_idx = self.active_idx_per_task[task_idx]
 
 		if task_idx == 0 and not is_boundary:
 			peak_ram = self.strat.learn_batch(task_count, {}, train_loader, False)
@@ -348,8 +364,14 @@ class FlowerClient_NR_Root(fl.client.NumPyClient):
 			self.set_parameters_fc(state_dict)
 		except:
 			print('')
-		eval_loader = self.valloader[self._task_idx(config["server_round"])]
-		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, self.y_labels, self.DEVICE)
+		task_idx = self._task_idx(config["server_round"])
+		eval_loader = self.valloader[task_idx]
+		if self.cumulative_idx_per_task is not None:
+			active_idx = self.cumulative_idx_per_task[task_idx]
+			y_labels = [self.y_labels[i] for i in active_idx]
+		else:
+			active_idx, y_labels = None, self.y_labels
+		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
@@ -358,7 +380,7 @@ class FlowerClient_NR_Root(fl.client.NumPyClient):
 
 class FlowerClient_LGR(fl.client.NumPyClient):
 	def __init__(self, cid, net, trainloader, valloader, testloader, epochs, y_labels, cl_strategy, agent_config, nrounds, path, DEVICE, num_clients,
-	             strat_name, params, gr, n_tasks=2):
+	             strat_name, params, gr, n_tasks=2, active_idx_per_task=None, cumulative_idx_per_task=None):
 		self.cid = cid
 		# self.net = net
 		self.trainloaders = trainloader
@@ -381,6 +403,9 @@ class FlowerClient_LGR(fl.client.NumPyClient):
 		# boundary round is still that completing task's last round.
 		self.n_tasks = n_tasks
 		self.rounds_per_task = self.nrounds // n_tasks
+		# FCL Axis A masking -- see client/default.py:FlowerClientCL.
+		self.active_idx_per_task = active_idx_per_task
+		self.cumulative_idx_per_task = cumulative_idx_per_task
 
 	def _task_idx(self, server_round):
 		return min((server_round - 1) // self.rounds_per_task, self.n_tasks - 1)
@@ -443,6 +468,8 @@ class FlowerClient_LGR(fl.client.NumPyClient):
 		task_idx = self._task_idx(server_round)
 		train_loader = self.trainloaders[task_idx][int(self.cid)]
 		is_boundary = self._is_boundary(server_round, task_idx)
+		if self.active_idx_per_task is not None:
+			self.strat.active_idx = self.active_idx_per_task[task_idx]
 
 		if is_boundary:
 			# Boundary round is still the completing task's last round of
@@ -481,8 +508,14 @@ class FlowerClient_LGR(fl.client.NumPyClient):
 			self.set_parameters_fc(state_dict)
 		except:
 			print('')
-		eval_loader = self.valloader[self._task_idx(config["server_round"])]
-		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, self.y_labels, self.DEVICE)
+		task_idx = self._task_idx(config["server_round"])
+		eval_loader = self.valloader[task_idx]
+		if self.cumulative_idx_per_task is not None:
+			active_idx = self.cumulative_idx_per_task[task_idx]
+			y_labels = [self.y_labels[i] for i in active_idx]
+		else:
+			active_idx, y_labels = None, self.y_labels
+		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')

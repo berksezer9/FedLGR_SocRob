@@ -32,6 +32,18 @@ class RMSELoss(torch.nn.Module):
 
 
 def truncate_float(float_number, decimal_places):
+	# NaN/inf guard: a degenerate round (e.g. a per-task test split small
+	# enough that a batch's Pearson correlation is undefined even after
+	# test()'s own jitter-retry fallback -- more likely with OfficeDB's
+	# smaller per-task-per-client splits than MANNERS-DB's original scale)
+	# used to crash `int(nan * multiplier)` with ValueError here, killing an
+	# entire multi-strategy/reg-coef sweep over one bad round. Passing
+	# NaN/inf through unchanged (instead of truncating, which is meaningless
+	# for them anyway) keeps the run alive and the value visibly NaN in the
+	# results CSV, rather than silently swallowing it into a valid-looking
+	# number or fatally crashing.
+	if math.isnan(float_number) or math.isinf(float_number):
+		return float_number
 	multiplier = 10 ** decimal_places
 	return int(float_number * multiplier) / multiplier
 
@@ -182,7 +194,12 @@ def pearson_correlation(labels, outputs):
 	return correlation
 
 
-def test(net, testloader, y_labels, DEVICE):
+def test(net, testloader, y_labels, DEVICE, active_idx=None):
+	# active_idx: optional list of output-column indices to restrict
+	# loss/rmse/pcc to (FCL Axis A action-subset masking -- see
+	# OFFICEDB_MODIFICATIONS.md). y_labels must already correspond 1:1 to
+	# active_idx (i.e. len(y_labels) == len(active_idx)) when given; None
+	# (default) reproduces the original full-output-space behaviour exactly.
 	criterion = torch.nn.MSELoss()
 	RMSE = RMSELoss()
 	pearson = {y_labels[i]: [] for i in range(len(y_labels))}
@@ -193,6 +210,9 @@ def test(net, testloader, y_labels, DEVICE):
 		for features, labels in testloader:
 			features, labels = features.to(DEVICE), labels.to(DEVICE)
 			outputs = net(features)
+			if active_idx is not None:
+				outputs = outputs[:, active_idx]
+				labels = labels[:, active_idx]
 			loss.append(criterion(outputs, labels).item())
 			rmse.append(RMSE(outputs, labels).item())
 			# total += labels.size(0)
@@ -202,10 +222,10 @@ def test(net, testloader, y_labels, DEVICE):
 				print("-----------------------------labels")
 			if torch.isnan(outputs).any():
 				print("-----------------------------outputs")
-			
+
 			labels = labels.cpu().numpy()
 			outputs = outputs.cpu().numpy()
-			
+
 			for i in range(len(y_labels)):
 				if len(labels[:, i]) > 1 and len(outputs[:, i]) > 1:
 					temp = pearsonr(labels[:, i], outputs[:, i])[0]
@@ -294,7 +314,7 @@ def get_eval_fn(net, testloader, y_labels, DEVICE):
 	return evaluate
 
 
-def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks=2):
+def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks=2, active_idx_per_task=None):
 	# testloader is the cumulative per-task-boundary test loader list from
 	# dataloader.utils.task_splitter (tasks 0..task_idx combined) -- see
 	# OFFICEDB_MODIFICATIONS.md. Originally hardcoded to "<=5"/testloader[0]
@@ -304,13 +324,23 @@ def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks
 	# same two loaders, just computed as one pooled test() call instead of
 	# two averaged ones -- an intentional, more standard combined-eval
 	# computation, not a behavior bug.
+	#
+	# active_idx_per_task: optional list (len n_tasks) of cumulative active
+	# output-column indices for FCL Axis A (action-subset masking) -- None
+	# (default) reproduces the original unmasked full-output-space behaviour.
 	def evaluate(server_round: int, weights: fl.common.NDArrays, config: Dict[str, Scalar]) -> Optional[Tuple[float, Dict[str, Scalar]]]:
 		net.train()
 		params_dict = zip(net.state_dict().keys(), weights)
 		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
 		net.load_state_dict(state_dict, strict=True)
 		task_idx = min((server_round - 1) // rounds_per_task, n_tasks - 1)
-		loss, avg_pearson, avg_rmse = test(net, testloader[task_idx], y_labels, DEVICE)
+		if active_idx_per_task is not None:
+			active_idx = active_idx_per_task[task_idx]
+			task_y_labels = [y_labels[i] for i in active_idx]
+		else:
+			active_idx = None
+			task_y_labels = y_labels
+		loss, avg_pearson, avg_rmse = test(net, testloader[task_idx], task_y_labels, DEVICE, active_idx=active_idx)
 
 		print("Round %s, Loss %s, Pearson %s, RMSE %s" % (server_round, loss, avg_pearson, avg_rmse))
 		return loss, {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}

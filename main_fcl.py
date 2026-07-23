@@ -4,7 +4,7 @@ from CL.default import EWC
 from client.default import FlowerClientCL, FlowerClient_NR
 from client.fedRoot import FlowerClientCL_Root, FlowerClient_NR_Root, FlowerClient_LGR
 from models.GenNet import VAE
-from dataloader.utils import task_splitter
+from dataloader.utils import task_splitter, load_datasets
 from server.strategies import FedAvgWithAccuracyMetric
 import ray
 import flwr as fl
@@ -115,35 +115,40 @@ def run(args):
                               testloader=testloader, epochs=int(args.epochs),
                               y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                               path=f"{output_reg}",
-                              DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
+                              DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
+                              active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
 
     def client_fn_NR(cid) -> FlowerClient_NR:
         return FlowerClient_NR(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                testloader=testloader, epochs=int(args.epochs),
                                y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                path=f"{output_NR}",
-                               DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
+                               DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
+                               active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
 
     def client_fn_reg_root(cid) -> FlowerClientCL_Root:
         return FlowerClientCL_Root(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                    testloader=testloader, epochs=int(args.epochs),
                                    y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                    path=f"{output_root_reg}",
-                                   DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
+                                   DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
+                                   active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
 
     def client_fn_NR_root(cid) -> FlowerClient_NR_Root:
         return FlowerClient_NR_Root(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                     testloader=testloader, epochs=int(args.epochs),
                                     y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                     path=f"{output_root_NR}",
-                                    DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
+                                    DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
+                                    active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
 
     def client_fn_LGR(cid) -> FlowerClient_LGR:
         return FlowerClient_LGR(cid, net=net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
                                 testloader=testloader, gr=gr.to(DEVICE), epochs=int(args.epochs),
                                 y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                 path=f"{output}",
-                                DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks)
+                                DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
+                                active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
 
     if args.model == 'MobileNet':
         from models.MobileNet import Net
@@ -163,6 +168,28 @@ def run(args):
             return v
     task_values = [_coerce(v) for v in args.task_values.split(',')] if args.task_values else [1, 0]
 
+    # FCL Axis A (action-subset): 'action_subset' mode doesn't row-filter by
+    # a task column at all (every scene is relevant to every task -- see
+    # OFFICEDB_MODIFICATIONS.md) -- it reuses the SAME single train/test
+    # split for every task and instead masks the loss/eval to each task's
+    # active output columns. active_idx_per_task[t] is task t's OWN
+    # exclusive columns (used for training); cumulative_idx_per_task[t] is
+    # the union of columns revealed by tasks 0..t (used for evaluation, per
+    # the "train exclusive, evaluate cumulative" protocol). Both are None in
+    # the default 'row_filter' mode, reproducing the original/Axis B
+    # behaviour exactly.
+    if args.axis_mode == 'action_subset':
+        action_groups = [grp.split('|') for grp in args.action_groups.split(';')]
+        active_idx_per_task = [[action_cols.index(a) for a in grp] for grp in action_groups]
+        cumulative_idx_per_task = []
+        seen = []
+        for idxs in active_idx_per_task:
+            seen = seen + [i for i in idxs if i not in seen]
+            cumulative_idx_per_task.append(list(seen))
+    else:
+        active_idx_per_task = None
+        cumulative_idx_per_task = None
+
     # make a directory in the output folder with name "YYMMDD_HHMMSS" followed by the arguments
     experiment_path = f"{args.output}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.strategy_fl}_{args.strategy_cl}_{args.model}_{args.rounds}_{args.icl}_{args.fcl}_{args.aug}_{args.processor_type}"
     if not os.path.exists(experiment_path):
@@ -180,6 +207,14 @@ def run(args):
         ray_init_args = {"num_gpus": num_GPUs, "num_cpus": num_CPUs}
         DEVICE = torch.device("cpu")
         gpu_flag = 0
+    # Ray defaults its temp dir to /tmp/ray -- on a shared Wilkes3 GPU node
+    # /tmp is node-local but can already be owned by another user's leftover
+    # Ray session, surfacing as a PermissionError on
+    # /tmp/ray/ray_current_cluster. RAY_TMPDIR (set by the calling sbatch
+    # script/smoke test, not a Ray-native env var) lets that be overridden
+    # without hardcoding a path here.
+    if os.environ.get("RAY_TMPDIR"):
+        ray_init_args["_temp_dir"] = os.environ["RAY_TMPDIR"]
 
     # Initial RAM and CPU Usage.
     ramu = RAMU()
@@ -201,9 +236,20 @@ def run(args):
         if not os.path.exists(f"{args.output}/{n_cl}"):
             os.mkdir(f"{args.output}/{n_cl}")
 
-        trainloaders, valloaders, testloader, y_labels = task_splitter(
-            path=args.path, task_col=args.task_col, task_values=task_values, n_clients=n_cl, aug=args.aug,
-            batch_size=args.batch_size, action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col)
+        if args.axis_mode == 'action_subset':
+            # Axis A: one shared partition reused across every task (not a
+            # per-task row filter) -- see OFFICEDB_MODIFICATIONS.md and the
+            # active_idx_per_task/cumulative_idx_per_task computation above.
+            trainloaders_single, testloader_single, y_labels, _ = load_datasets(
+                num_clients=n_cl, path=args.path, aug=args.aug, batch_size=args.batch_size,
+                action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col)
+            trainloaders = [trainloaders_single] * args.n_tasks
+            valloaders = [testloader_single] * args.n_tasks
+            testloader = testloader_single
+        else:
+            trainloaders, valloaders, testloader, y_labels = task_splitter(
+                path=args.path, task_col=args.task_col, task_values=task_values, n_clients=n_cl, aug=args.aug,
+                batch_size=args.batch_size, action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col)
 
 
         if args.strategy_fl == 'all':
@@ -264,7 +310,8 @@ def run(args):
                                 on_fit_config_fn=fit_config,
                                 on_evaluate_config_fn=evaluate_config,
                                 evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels,
-                                                            rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks)
+                                                            rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks,
+                                                            active_idx_per_task=cumulative_idx_per_task)
                             )
                             
                             rambef = ramu.compute("BEFORE EVALUATION")
@@ -313,7 +360,8 @@ def run(args):
                                 on_fit_config_fn=fit_config,
                                 on_evaluate_config_fn=evaluate_config,
                                 evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels,
-                                                            rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks)
+                                                            rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks,
+                                                            active_idx_per_task=cumulative_idx_per_task)
 
                             )
                             rambef = ramu.compute("BEFORE EVALUATION")
@@ -528,6 +576,14 @@ if __name__ == "__main__":
     parser.add_argument("--action_cols", type=str, default=None, help="Comma-separated action column names (default: MANNERS-DB's 8 hardcoded names)")
     parser.add_argument("--extra_cols", type=str, default=None, help="Comma-separated pass-through id columns, e.g. group/task/split columns (default: 'Using circle,Using arrow')")
     parser.add_argument("--split_col", type=str, default=None, help="Column with pre-computed train/test labels, used instead of the internal random 75/25 split per task")
+    parser.add_argument("--axis_mode", type=str, default="row_filter", choices=["row_filter", "action_subset"],
+                         help="'row_filter' (default): task_col/task_values row-filtering (MANNERS-DB circle/arrow, OfficeDB Axis B). "
+                              "'action_subset': OfficeDB Axis A -- every scene is relevant to every task; one shared train/test split is "
+                              "reused across all tasks and --action_groups selects which output columns are active per task instead.")
+    parser.add_argument("--action_groups", type=str, default=None,
+                         help="Only used when --axis_mode action_subset. Per-task active action groups: tasks separated by ';', "
+                              "action names within a task separated by '|' (names must be a subset of --action_cols). "
+                              "E.g. 'A|B|C;D|E|F;G|H|I' for 3 tasks of 3 actions each.")
     args = parser.parse_args()
 
     print("Running with the following arguments:")

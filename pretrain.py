@@ -33,11 +33,17 @@ def run(args):
         models=[mobNet(num_classes=args.num_classes)]
         names=['MobileNet']
 
-    # action_cols=None (default) reproduces MANNERS-DB's 8 hardcoded action
-    # names; OfficeDB adaptation passes --action_cols (see OFFICEDB_MODIFICATIONS.md).
+    # action_cols/extra_cols=None (default) reproduce MANNERS-DB's 8 hardcoded
+    # action names + 'Using circle'/'Using arrow'; OfficeDB adaptation passes
+    # --action_cols/--extra_cols (see OFFICEDB_MODIFICATIONS.md). Without
+    # --extra_cols, load_images() looks for 'Using circle'/'Using arrow' in
+    # every row regardless of the actual CSV schema -- on OfficeDB's
+    # Robot/Room/Split-shaped all_data.csv that KeyErrors per-row inside
+    # load_images' try/except, silently producing an empty dataframe.
     action_cols = args.action_cols.split(',') if args.action_cols else None
+    extra_cols = args.extra_cols.split(',') if args.extra_cols else None
     data=load_datasets_pretrain(num_clients=1, split= args.split_ratio, batch_size=args.batch_size, path=args.data, aug=False, DEVICE=DEVICE,
-                                 action_cols=action_cols)
+                                 action_cols=action_cols, extra_cols=extra_cols)
     for i in range(len(models)):
         model=models[i]
         model_n=names[i]
@@ -67,6 +73,7 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--processor', type=str, default='cpu', help='Processor to run the scrip')
     parser.add_argument('--num_classes', type=int, default=8, help='Number of action output heads (8=MANNERS-DB, 9=OfficeDB)')
     parser.add_argument('--action_cols', type=str, default=None, help='Comma-separated action column names (default: MANNERS-DB\'s 8 hardcoded names)')
+    parser.add_argument('--extra_cols', type=str, default=None, help='Comma-separated pass-through id columns, e.g. group/task/split columns (default: \'Using circle,Using arrow\')')
     args = parser.parse_args()
 
     print("Running with following arguments:")

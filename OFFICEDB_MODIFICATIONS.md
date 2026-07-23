@@ -77,11 +77,33 @@ Added `--num_classes` (default 8), `--group_col`, `--split_col`, `--action_cols`
 `Net(num_classes=...)` and both `load_datasets(...)` call sites (plain-FL and FedRoot-base
 branches).
 
+Also: both `ray_init_args = {...}` construction sites now add `ray_init_args["_temp_dir"] =
+os.environ["RAY_TMPDIR"]` when that env var is set (no-op otherwise, exact original behavior).
+Discovered running the smoke test on a shared Wilkes3 `ampere` node: Ray/Flower's
+`fl.simulation.start_simulation` defaults its temp dir to `/tmp/ray`, which is node-local but can
+already be populated by another user's leftover Ray session with different permissions —
+surfaces as `PermissionError: [Errno 13] .../tmp/ray/ray_current_cluster`. Ray 2.10 (the version
+pinned here) does **not** read any `RAY_TMPDIR`-style env var itself — `_temp_dir` must be passed
+as a `ray.init()` kwarg, which only `ray_init_args` reaches — so an env var alone (without this
+code change) would have silently done nothing. `RAY_TMPDIR` here is this repo's own convention,
+not a Ray-native variable; set by the calling sbatch script (`fedlgr_officedb/slurm/*.sbatch`) or
+`smoke_test/run_smoke_test.sh` to a private, job-unique directory -- must be **short**, not just
+private: Ray creates a Unix domain socket (`plasma_store`) under this dir plus its own
+session-id subdirectories, and Linux caps `AF_UNIX` paths at 107 bytes. A first attempt using a
+repo-rooted path (`.../afar-cfl-fedlgr_officedb/smoke_test/.ray_tmp/<jobid>/...`, ~140 chars
+once Ray's own subdirs are appended) blew past that and crashed with `OSError: AF_UNIX path
+length cannot exceed 107 bytes` on a real GPU smoke-test job -- fixed by using
+`/tmp/ray-<user>-<jobid>` instead (short, still unique per job/user so it doesn't reintroduce
+the permission clash this was meant to fix).
+
 ## 5. `main_fcl.py`
 
 - Added `--num_classes` (default 8), `--n_tasks` (default 2), `--task_col` (default
   `'Using circle'`), `--task_values` (default `None` -> `[1, 0]`), `--pretrained_dir`
-  (default `'models'`), `--action_cols`, `--extra_cols`, `--split_col`.
+  (default `'models'`), `--action_cols`, `--extra_cols`, `--split_col`, and (for FCL Axis A --
+  see item 12 below) `--axis_mode`, `--action_groups`.
+- Same `RAY_TMPDIR` -> `ray_init_args["_temp_dir"]` addition as `main.py` (item 4 above), at
+  both of this file's `ray_init_args = {...}` sites.
 - `run_strategy(...)`: generalized the results CSV from fixed
   `Loss1/RMSE1/PCC1/Loss2/RMSE2/PCC2` columns to `n_tasks`-many `Loss{t}/RMSE{t}/PCC{t}`
   columns, read from `history.losses_distributed`/`history.losses_centralized` at each
@@ -152,11 +174,29 @@ land on the same two underlying loaders, just combined differently — a deliber
 standard combined-eval computation (and the one the design doc's cumulative-eval protocol
 calls for), not a regression.
 
+`truncate_float(float_number, decimal_places)`: added a NaN/inf guard (returns the value
+unchanged instead of `int(float_number * multiplier)`, which raises `ValueError: cannot convert
+float NaN to integer`). Hit on a real CPU smoke-test run: a degenerate round produced `nan` for
+`avg_pearson_score` (small per-task-per-client test splits make an undefined/degenerate Pearson
+correlation more likely than at MANNERS-DB's original scale, even with `test()`'s own
+jitter-retry fallback) and crashed `run_strategy`'s results-CSV write, which would otherwise
+kill an entire multi-strategy/reg-coef sweep over one bad round rather than just recording NaN
+for that cell.
+
 ## 9. `pretrain.py`
 
 Added `--num_classes` (default 8) and `--action_cols`, threaded to the model constructors and
 `load_datasets_pretrain`. `y_labels` list generalized from the hardcoded `[0..7]` to
 `list(range(args.num_classes))`.
+
+Also gained a `--extra_cols` CLI flag (threaded into the pre-existing `load_datasets_pretrain(...,
+extra_cols=...)` param, which `main.py`/`main_fcl.py` already exposed but this script never did).
+Discovered while wiring the smoke test: without it, `load_images()` defaults to looking for
+`'Using circle'`/`'Using arrow'` in every row regardless of the actual `all_data.csv` schema —
+on OfficeDB's `Robot,Room,Split`-shaped FL data this KeyErrors per-row inside `load_images`'s
+try/except, silently producing an empty dataframe rather than a visible crash.
+`fedlgr_officedb/pretrain_officedb.py` updated to pass `--extra_cols Robot,Room,Split`
+accordingly.
 
 ## 10. `run_CL_local.sh`
 
@@ -183,6 +223,82 @@ Pre-existing vendor bug, unrelated to the FCL generalization above.
 - Unpinned `grpcio` (was `==1.51.3`): `flwr==1.12.0` requires `grpcio>=1.60.0,<1.65.1` (or
   `>1.66.1`), incompatible with the original pin. Left unpinned rather than re-pinned, since
   the exact patch version doesn't matter here — let `flwr`'s own dependency resolution pick one.
+
+## 12. FCL Axis A (action-subset) masking mechanism
+
+FCL Axis A (`fedlgr_officedb/config.py`'s `AXIS_A_TASKS`, 3 tasks) doesn't fit the
+`task_col`/`task_values` row-filtering model `task_splitter` already generalized for Axis B: an
+action-subset task isn't a subset of *scenes* (every scene is relevant to every task), it's a
+subset of the 9 output *columns* — only the active 3-of-9 action columns differ per task. This
+needed a genuinely new mechanism (loss/eval column-masking), not just new config, across
+several files:
+
+- **`utils.py`**: `test(net, testloader, y_labels, DEVICE, active_idx=None)` gained an
+  `active_idx` param — when given, slices `outputs`/`labels` to those column indices before
+  computing loss/RMSE/PCC. `y_labels` must already correspond 1:1 to `active_idx` when given
+  (caller's responsibility, same convention as `action_cols` elsewhere). `get_eval_fn_cl(...)`
+  gained `active_idx_per_task=None` (a list indexed by task boundary) and threads the
+  corresponding `active_idx`/sliced `y_labels` into `test()` each round. `None` (default)
+  reproduces the original unmasked behavior exactly — zero effect on Axis B / the original
+  2-task circle-arrow case.
+- **`CL/default.py`**: `NormalNN.__init__` gained `self.active_idx = None`; `NormalNN.criterion`
+  masks `preds`/`targets` by it before computing the base task loss. Since `L2.criterion` (EWC/
+  EWCOnline/SI/MAS's shared base) calls `super().criterion()` for its task-loss term before
+  adding its own regularization, and `Naive_Rehearsal` inherits `criterion` unmodified, this one
+  change covers all five of EWC/EWCOnline/SI/MAS/NR without touching their own code. `MAS`'s
+  `calculate_importance` is the one exception — its importance signal is label-free (squared
+  output magnitude, not a loss against targets), so it doesn't route through `criterion()`;
+  masked directly by slicing `preds` to `self.active_idx` before squaring, so importance isn't
+  computed over action columns a task hasn't revealed yet.
+- **`LatentGenerativeReplay`** (LGR): previously had `self.criterion = nn.MSELoss()` assigned as
+  a plain **instance attribute** in `__init__`, which shadows any method of the same name and
+  made masking impossible without editing every one of its 3 separate inline
+  `self.criterion(out, targets)` call sites inside `learn_batch` (real Task-1 training, mixed
+  real+pseudo-replay training, and the frozen-Top end-to-end pass — `update_model` is defined
+  but never actually called by `learn_batch`, which reimplements the same logic inline each
+  time). Fixed by removing that instance attribute and adding a `criterion()` **method**
+  (mirroring `NormalNN`'s) that masks via `self.active_idx` and delegates to the already-existing
+  `self.criterion_fn`. All 3 call sites now get masking automatically, with no per-call-site
+  changes needed.
+  - **Design note on mixed real+replay batches**: LGR's post-task-1 training mixes real
+    current-task samples with self-generated pseudo-replay samples (pseudo-*labels* are
+    generated fresh by the model's own current Top head at replay time, i.e. self-distillation,
+    not stored ground truth from the original task). A single `active_idx` applied uniformly to
+    the whole mixed batch is correct here specifically *because* Axis A's "task boundary" is an
+    artificial column-visibility construct on top of fully-annotated data (OfficeDB's annotation
+    CSVs have real ground truth for all 9 actions on every scene, unlike Axis B's genuinely
+    per-domain-only images) — masking real samples to the current task's active columns doesn't
+    discard/misuse any data, it's still that image's true label at those column positions. No
+    per-sample masking (which would need memory/replay buffers to carry a mask alongside each
+    stored sample) was needed.
+- **`client/default.py`** (`FlowerClientCL`, `FlowerClient_NR`) and **`client/fedRoot.py`**
+  (`FlowerClientCL_Root`, `FlowerClient_NR_Root`, `FlowerClient_LGR`): all five gained
+  `active_idx_per_task=None, cumulative_idx_per_task=None` constructor params. `fit()` sets
+  `self.strat.active_idx = active_idx_per_task[task_idx]` (this task's own exclusive columns)
+  right after computing `task_idx`, before any `learn_batch` call — so EWC/SI/MAS's
+  importance-estimation calls (which happen *inside* `learn_batch`) are automatically masked
+  too. `evaluate()` looks up `cumulative_idx_per_task[task_idx]` (the union of columns revealed
+  by tasks `0..task_idx` — the design doc's "train exclusive, evaluate cumulative" protocol) and
+  passes it + the correspondingly-sliced `y_labels` into `test(..., active_idx=...)`. Both
+  params default to `None`, reproducing unmasked behavior exactly for Axis B and the original
+  2-task case — no regression risk.
+- **`main_fcl.py`**: new `--axis_mode {row_filter,action_subset}` (default `row_filter`, i.e. the
+  existing `task_splitter` path, unchanged) and `--action_groups` (only used in
+  `action_subset` mode: per-task active action names, tasks separated by `;`, names within a
+  task by `|`, e.g. `"A|B|C;D|E|F;G|H|I"`). In `action_subset` mode, data loading calls
+  `dataloader.utils.load_datasets` (the existing FL-style loader — already does exactly
+  "one shared partition across N clients, no row filtering") **once**, and reuses that same
+  set of loaders for every task index (`trainloaders = [trainloaders_single] * n_tasks`, same
+  for the cumulative test loader) — no new vendor data-loading function was needed.
+  `active_idx_per_task`/`cumulative_idx_per_task` are computed once from `--action_groups`
+  against `--action_cols`'s canonical column order, and threaded into all 5 `client_fn_*`
+  closures and both `get_eval_fn_cl(...)` call sites (the two `FedAvg`-strategy branches;
+  `FedRoot`'s strategy construction never passes `evaluate_fn` at all in vendor's original
+  design, so its correctness rests entirely on the already-updated client-side `evaluate()`).
+
+`fedlgr_officedb/prepare_data.py`'s `prepare_axis_a()` reuses `prepare_office_fl()`'s pooled
+directory unchanged (no per-task dataset exists for Axis A — see that function's docstring).
+`fedlgr_officedb/run_fcl.py` gained `--axis {a,b}` to select between the two.
 
 ## Not changed
 
