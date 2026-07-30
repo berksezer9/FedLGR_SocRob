@@ -148,7 +148,7 @@ def run(args):
         os.makedirs(experiment_path)
     # update the output path
     args.output = experiment_path
-    num_CPUs = 4
+    num_CPUs = args.num_cpus
     if args.processor_type == 'gpu':
         num_GPUs = 1
         ray_init_args = {"num_gpus": num_GPUs, "num_cpus": num_CPUs}
@@ -179,10 +179,16 @@ def run(args):
     # Running the loop for clients between icl (low) and fcl (high)
     for n_cl in range(int(args.icl), int(args.fcl) + 1):
 
+        # Ray only runs clients concurrently up to floor(pool_cpus / cpus_per_client);
+        # dividing by n_cl here (mirroring the num_gpus division just above) is what
+        # lets all n_cl clients in a round train in parallel instead of serially --
+        # previously every client requested the *entire* CPU pool, capping concurrency
+        # at 1 regardless of how many cores the VM actually had. See
+        # OFFICEDB_MODIFICATIONS.md.
         if gpu_flag == 1:
-            client_res = {"num_gpus": num_GPUs / n_cl, "num_cpus": num_CPUs}
+            client_res = {"num_gpus": num_GPUs / n_cl, "num_cpus": num_CPUs / n_cl}
         else:
-            client_res = {"num_gpus": num_GPUs, "num_cpus": num_CPUs}
+            client_res = {"num_gpus": num_GPUs, "num_cpus": num_CPUs / n_cl}
 
         if not os.path.exists(f"{args.output}/{n_cl}"):
             os.mkdir(f"{args.output}/{n_cl}")
@@ -428,6 +434,7 @@ if __name__ == "__main__":
     parser.add_argument("--split_col", type=str, default=None, help="Column with pre-computed train/test labels, used instead of the internal random 75/25 split")
     parser.add_argument("--action_cols", type=str, default=None, help="Comma-separated action column names (default: MANNERS-DB's 8 hardcoded names)")
     parser.add_argument("--extra_cols", type=str, default=None, help="Comma-separated pass-through id columns, e.g. group/task/split columns (default: 'Using circle,Using arrow')")
+    parser.add_argument("--num_cpus", type=int, default=4, help="Total CPUs given to Ray's pool (set to the VM's vCPU count to enable concurrent clients; see OFFICEDB_MODIFICATIONS.md)")
     args = parser.parse_args()
 
     print("Running with the following arguments:")

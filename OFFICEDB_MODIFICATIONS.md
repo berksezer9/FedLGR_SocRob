@@ -300,6 +300,45 @@ several files:
 directory unchanged (no per-task dataset exists for Axis A — see that function's docstring).
 `fedlgr_officedb/run_fcl.py` gained `--axis {a,b}` to select between the two.
 
+## 13. `transfer_eval.py` (new file)
+
+Added for the office->home transfer-learning experiment (extra idea raised at the 2026-07-27
+supervisor meeting, see `docs/fedlgr_officedb_design.md`): loads an already-trained checkpoint
+(from `pretrain.py`), evaluates it zero-shot on a *different* prepared dataset (Home), and
+optionally fine-tunes on that dataset's train split before a second eval pass
+(`--finetune_epochs`). Not FCL, not federated -- a single centralized model. Mirrors
+`pretrain.py`'s structure (same `--num_classes`/`--action_cols`/`--extra_cols` generalization,
+same relative `sys.path.append('../')` import of `utils.train`/`utils.test`) but uses
+`dataloader.utils.load_datasets(num_clients=1, ..., split_col='Split')` instead of
+`load_datasets_pretrain`, since this needs a real held-out test split rather than
+`pretrain.py`'s single train==test `split_ratio` slice. `test()`'s return order is
+`(loss, pcc, rmse)` (confirmed via source inspection of `utils.py`, not `(loss, rmse, pcc)` --
+double-checked against the smoke-test pretrain log's printed triple, `rmse == sqrt(loss)`
+holds only under that ordering). Driven by `fedlgr_officedb/transfer_office_to_home.py`
+(thin subprocess wrapper, same pattern as `pretrain_officedb.py` -> `pretrain.py`).
+
+## 14. `main.py` -- Ray client-concurrency fix (added --num_cpus, scaled client_res)
+
+Discovered 2026-07-30 while the `by-robot` FL sweep job was ~12.6h in and only 3/5 rounds into
+strategy 1 of 10 (`--strategy all --base all` runs FedAvg/FedBN/FedOptAdam/FedProx/FedDistill +
+FedRoot x 5 bases = 10 strategy-runs per job): serial console showed only one `ClientAppActor`
+training at a time per round despite 3 clients being sampled, on an 8-vCPU GCE VM. Root cause:
+`num_CPUs` was hardcoded to `4` and **both** the CPU and GPU branches of `client_res` requested
+the *entire* `num_CPUs` pool per client (only `num_gpus` was divided by `n_cl`, `num_cpus` never
+was) -- Ray/Flower simulations cap concurrent clients at
+`floor(pool_cpus / cpus_per_client_request)`, so requesting the whole pool per client forces
+strict serialization regardless of how many cores the VM actually has (confirmed against
+Flower's own simulation-resourcing docs). Fixed by: (1) adding a `--num_cpus` CLI arg (default
+4, unchanged from original for anyone still relying on the default) so the pool size can be set
+to match the VM's real vCPU count, and (2) dividing `num_cpus` by `n_cl` in *both* branches of
+the `client_res` dict (mirroring the `num_gpus / n_cl` pattern the GPU branch already had for
+GPUs, just never had for CPUs). Net effect: on an 8-vCPU VM with 3 clients and
+`--num_cpus 8`, all 3 clients now train concurrently (~2.7 CPUs each) instead of one at a time --
+expected ~3x wall-clock speedup per FL round. Does not affect the already-running
+`fedlgr-fl-by-robot` job (image not rebuilt mid-run); applies to all FL/FCL/transfer jobs
+submitted after the image is rebuilt and repushed. `vertex/gce_submit_job.py` callers should now
+pass `--num_cpus <machine's vCPU count>` alongside the module args.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

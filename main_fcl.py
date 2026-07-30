@@ -196,7 +196,7 @@ def run(args):
         os.makedirs(experiment_path)
     # update the output path
     args.output = experiment_path
-    num_CPUs = 4
+    num_CPUs = args.num_cpus
     if args.processor_type == 'gpu':
         num_GPUs = 1
         ray_init_args = {"num_gpus": num_GPUs, "num_cpus": num_CPUs}
@@ -228,10 +228,12 @@ def run(args):
     for n_cl in range(int(args.icl), int(args.fcl) + 1):
         net = Net(num_classes=args.num_classes)
         params = get_parameters(net)
+        # See main.py / OFFICEDB_MODIFICATIONS.md item 14: divide num_cpus by n_cl so
+        # clients aren't each requesting Ray's entire CPU pool (which serializes them).
         if gpu_flag == 1:
-            client_res = {"num_gpus": num_GPUs / n_cl, "num_cpus": num_CPUs}
+            client_res = {"num_gpus": num_GPUs / n_cl, "num_cpus": num_CPUs / n_cl}
         else:
-            client_res = {"num_gpus": num_GPUs, "num_cpus": num_CPUs}
+            client_res = {"num_gpus": num_GPUs, "num_cpus": num_CPUs / n_cl}
 
         if not os.path.exists(f"{args.output}/{n_cl}"):
             os.mkdir(f"{args.output}/{n_cl}")
@@ -584,6 +586,7 @@ if __name__ == "__main__":
                          help="Only used when --axis_mode action_subset. Per-task active action groups: tasks separated by ';', "
                               "action names within a task separated by '|' (names must be a subset of --action_cols). "
                               "E.g. 'A|B|C;D|E|F;G|H|I' for 3 tasks of 3 actions each.")
+    parser.add_argument("--num_cpus", type=int, default=4, help="Total CPUs given to Ray's pool (set to the VM's vCPU count to enable concurrent clients; see OFFICEDB_MODIFICATIONS.md)")
     args = parser.parse_args()
 
     print("Running with the following arguments:")
