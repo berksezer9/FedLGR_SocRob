@@ -23,6 +23,21 @@ _DEFAULT_ACTION_COLS = [
 ]
 _DEFAULT_EXTRA_COLS = ['Using circle', 'Using arrow']
 
+# Every DataLoader below that wraps CustomDataset does real per-sample disk
+# I/O (Image.open in imageloader.py's __getitem__), and none of them
+# previously set num_workers (default 0 = fully synchronous, single-process
+# loading, no prefetching). Confirmed via a direct timing check (see
+# fedlgr_officedb_gpu branch/project memory) that real image reads on this
+# cluster's shared Lustre currently take ~85-115ms each -- with num_workers=0
+# that's fully serialized against training, dwarfing the actual (sub-second)
+# GPU/CPU compute per batch. 2 workers is deliberately conservative, not
+# tuned: chosen to fit within the smallest per-client CPU budget in use
+# (4 CPUs/client on GPU jobs, see submit_fl_sweep.py's COMPUTE dict) while
+# leaving headroom for the main process. Purely a perf change -- does not
+# affect training results (same data, same order via shuffle=..., just
+# loaded by worker subprocesses instead of the main process).
+NUM_WORKERS = 2
+
 
 def load_universal(path, stamp_col='Stamp', mean_cols=None):
 	data = pd.read_csv(path + "/all_data.csv")
@@ -161,7 +176,7 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 		else:
 			teacher_model.to(DEVICE)
 			# trainset_distil = CustomDataset(dataframe=data_images_train, transform=train_transform)
-			train_loader_distil = DataLoader(trainset, batch_size=batch_size, shuffle=False, drop_last=True)
+			train_loader_distil = DataLoader(trainset, batch_size=batch_size, shuffle=False, drop_last=True, num_workers=NUM_WORKERS)
 			print("Training Teacher Model")
 			train(model=teacher_model, train_loader=train_loader_distil, epochs=10, DEVICE=DEVICE)
 		if DEVICE.type == 'cuda':
@@ -210,13 +225,38 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 		# 	# trainloaders.append(
 		# 	# 	predict_gen_distil(teacher_model, DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True), DEVICE))
 		# else:
-		trainloaders.append(DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True))
+		trainloaders.append(DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=NUM_WORKERS))
 	if distil:
 		teacher_model = None
 	# valloaders.append(DataLoader(ds_val, batch_size=batch_size))
-	testloader = DataLoader(testset, batch_size=batch_size)
+
+	# Per-client test partitions, mirroring the trainset partitioning above
+	# (group_col-aware if given, else a matching random_split) -- federated
+	# ("distributed") evaluation is supposed to measure each client's own
+	# held-out data, not the same pooled set re-evaluated N times. See
+	# OFFICEDB_MODIFICATIONS.md item 16. `testloader` (pooled, unchanged) is
+	# kept for the separate centralized evaluate_fn.
+	if group_col is not None and group_col in data_images_test.columns:
+		test_groups = sorted(data_images_test[group_col].unique())
+		if len(test_groups) != num_clients:
+			raise ValueError(
+				f"group_col={group_col!r} has {len(test_groups)} unique test-split values {test_groups} "
+				f"but num_clients={num_clients} -- these must match for by-group partitioning.")
+		test_datasets = [
+			torch.utils.data.Subset(testset, data_images_test.index[data_images_test[group_col] == g].tolist())
+			for g in test_groups
+		]
+	else:
+		test_partition_size = len(testset) // num_clients
+		test_lengths = [test_partition_size] * num_clients
+		test_datasets = random_split(
+			torch.utils.data.Subset(testset, range(test_partition_size * num_clients)),
+			test_lengths, torch.Generator().manual_seed(42))
+	testloaders = [DataLoader(ds, batch_size=batch_size, num_workers=NUM_WORKERS) for ds in test_datasets]
+
+	testloader = DataLoader(testset, batch_size=batch_size, num_workers=NUM_WORKERS)
 	# return trainloaders, valloaders, testloader, y_labels
-	return trainloaders, testloader, y_labels, data_permutation
+	return trainloaders, testloaders, testloader, y_labels, data_permutation
 
 
 def load_datasets_pretrain(num_clients, path, split, aug=True, batch_size=16, out='', DEVICE=torch.device("cpu"),
@@ -247,7 +287,7 @@ def load_datasets_pretrain(num_clients, path, split, aug=True, batch_size=16, ou
 	# Split each partition into train/val and create DataLoader
 	trainloaders = []
 	# valloaders = []
-	testloader = DataLoader(testset, batch_size=batch_size)
+	testloader = DataLoader(testset, batch_size=batch_size, num_workers=NUM_WORKERS)
 	# return trainloaders, valloaders, testloader, y_labels
 	return testloader
 
@@ -324,7 +364,7 @@ def task_splitter(path, task_col, task_values, n_clients, aug, batch_size=16,
 		combined_test = pd.concat(running_test_frames, axis=0).sample(frac=1).reset_index(drop=True)
 		cumulative_test.append(
 			DataLoader(CustomDataset(combined_test, test_transform, label_start=label_start),
-					   batch_size=batch_size, drop_last=True))
+					   batch_size=batch_size, drop_last=True, num_workers=NUM_WORKERS))
 
 		if aug:
 			train_frame = load_augmented(train_frame)
@@ -336,7 +376,7 @@ def task_splitter(path, task_col, task_values, n_clients, aug, batch_size=16,
 			chunk = train_frame.iloc[i * size:(i + 1) * size]
 			client_loaders.append(
 				DataLoader(CustomDataset(chunk, train_transform, label_start=label_start), batch_size=batch_size,
-						   shuffle=True, drop_last=True))
+						   shuffle=True, drop_last=True, num_workers=NUM_WORKERS))
 		train_per_task_cl.append(client_loaders)
 
 	final_test = cumulative_test[-1]

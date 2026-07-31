@@ -4,7 +4,7 @@ import flwr as fl
 import torch.nn as nn
 from datetime import datetime
 
-from server.strategies import FedAvgWithAccuracyMetric, FedProxWithAccuracyMetric, FedOptAdamStrategy
+from server.strategies import FedAvgWithAccuracyMetric, FedProxWithAccuracyMetric, FedOptAdamStrategy, bn_buffer_mask
 from server.utils import fit_config, evaluate_config
 
 from client.fedBN import FlowerClient_BN, FlowerClient_BN_Root
@@ -116,19 +116,19 @@ def savecomp(output, strat, rambef, ramaf, cpubef, cpuaf, gpubeff, gpuaf):
 
 def run(args):
     def client_fn(cid):
-        return FlowerClient(cid, net.to(DEVICE), trainloaders[int(cid)], testloader, epochs=int(args.epochs),
+        return FlowerClient(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
                             y_labels=y_labels, num_clients=int(n_cl), DEVICE=DEVICE, path=path)
 
     def client_fn_root(cid):
-        return FlowerClient_Root(cid, net.to(DEVICE), trainloaders[int(cid)], testloader, epochs=int(args.epochs),
+        return FlowerClient_Root(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
                                  y_labels=y_labels, num_clients=int(n_cl), DEVICE=DEVICE, path=path)
 
     def client_fn_BN_Root(cid):
-        return FlowerClient_BN_Root(cid, net.to(DEVICE), trainloaders[int(cid)], testloader, epochs=int(args.epochs),
+        return FlowerClient_BN_Root(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
                                     y_labels=y_labels, num_clients=int(n_cl), DEVICE=DEVICE, path=path)
 
     def client_fn_BN(cid):
-        return FlowerClient_BN(cid, net.to(DEVICE), trainloaders[int(cid)], testloader, epochs=int(args.epochs),
+        return FlowerClient_BN(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
                                y_labels=y_labels, num_clients=int(n_cl), DEVICE=DEVICE, path=path)
 
     if args.model == 'MobileNet':
@@ -212,13 +212,13 @@ def run(args):
             # else:
             #     bn = False
             if 'Distill' in strat:
-                trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
+                trainloaders, testloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
                                                                                      distil=True, out=path, DEVICE=DEVICE,
                                                                                      data_permutation=data_permutation, teacher_model=net,
                                                                                      action_cols=action_cols, extra_cols=extra_cols,
                                                                                      split_col=args.split_col, group_col=args.group_col)
             else:
-                trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
+                trainloaders, testloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
                                                                                      DEVICE=DEVICE, data_permutation=data_permutation,
                                                                                      action_cols=action_cols, extra_cols=extra_cols,
                                                                                      split_col=args.split_col, group_col=args.group_col)
@@ -245,9 +245,22 @@ def run(args):
                 client_function = client_fn
 
             elif strat == 'FedOptAdam':
+                # flwr's FedAdam (unlike FedAvg/FedProx) requires an explicit
+                # initial_parameters -- see OFFICEDB_MODIFICATIONS.md item 17.
+                # buffer_mask: Adam-normalize only trainable params, plain-average
+                # BatchNorm running stats -- see item 19 (Adam applied to
+                # running_var pushes it negative -> NaN, at any eta).
+                # eta/tau: flwr's defaults (eta=0.1, tau=1e-9) still diverged even
+                # with buffer_mask applied (round-1 loss ~261 vs FedAvg's ~0.7-0.8
+                # on the same smoke test) -- too large a server step for this deep
+                # CNN. eta=0.01/tau=1e-3 match Reddi et al. 2020's own
+                # image-classification settings, not their simpler-task defaults
+                # (see item 19).
                 strategy = FedOptAdamStrategy(
                     min_available_clients=int(n_cl),
-                    # initial_parameters=fl.common.ndarrays_to_parameters(params),
+                    initial_parameters=fl.common.ndarrays_to_parameters(get_parameters(net)),
+                    buffer_mask=bn_buffer_mask(net.state_dict().keys()),
+                    eta=0.01, tau=1e-3,
                     on_fit_config_fn=fit_config,
                     on_evaluate_config_fn=evaluate_config,
                     evaluate_fn=get_eval_fn(central_model, testloader=testloader, DEVICE=DEVICE, y_labels=y_labels)
@@ -293,13 +306,13 @@ def run(args):
                     #     client_function = client_fn_root
 
                     if 'Distill' in base:
-                        trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
+                        trainloaders, testloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
                                                                                             distil=True, out=path, DEVICE=DEVICE,
                                                                                             data_permutation=data_permutation, teacher_model=net,
                                                                                             action_cols=action_cols, extra_cols=extra_cols,
                                                                                             split_col=args.split_col, group_col=args.group_col)
                     else:
-                        trainloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
+                        trainloaders, testloaders, testloader, y_labels, data_permutation = load_datasets(num_clients=int(n_cl), path=args.path, aug=args.aug, batch_size=args.batch_size,
                                                                                             DEVICE=DEVICE, data_permutation=data_permutation,
                                                                                             action_cols=action_cols, extra_cols=extra_cols,
                                                                                             split_col=args.split_col, group_col=args.group_col)
@@ -324,9 +337,15 @@ def run(args):
                         )
                         client_function = client_fn_root
                     elif base == 'FedOptAdam':
+                        # FedRoot-FedOptAdam: client_fn_root's get_parameters returns
+                        # net.conv_module's state dict only (root submodule), so
+                        # initial_parameters/buffer_mask must match that shape, not
+                        # the full net (see OFFICEDB_MODIFICATIONS.md items 17, 19).
                         strategy = FedOptAdamStrategy(
                             min_available_clients=int(n_cl),
-                            # initial_parameters=fl.common.ndarrays_to_parameters(params),
+                            initial_parameters=fl.common.ndarrays_to_parameters(get_parameters(net.conv_module)),
+                            buffer_mask=bn_buffer_mask(net.conv_module.state_dict().keys()),
+                            eta=0.01, tau=1e-3,
                             on_fit_config_fn=fit_config,
                             on_evaluate_config_fn=evaluate_config
                         )

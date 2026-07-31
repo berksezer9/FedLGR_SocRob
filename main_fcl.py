@@ -242,7 +242,7 @@ def run(args):
             # Axis A: one shared partition reused across every task (not a
             # per-task row filter) -- see OFFICEDB_MODIFICATIONS.md and the
             # active_idx_per_task/cumulative_idx_per_task computation above.
-            trainloaders_single, testloader_single, y_labels, _ = load_datasets(
+            trainloaders_single, _testloaders_per_client, testloader_single, y_labels, _ = load_datasets(
                 num_clients=n_cl, path=args.path, aug=args.aug, batch_size=args.batch_size,
                 action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col)
             trainloaders = [trainloaders_single] * args.n_tasks

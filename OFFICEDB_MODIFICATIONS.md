@@ -352,6 +352,171 @@ Fixed by reading the class count off the actual model output (`outputs[0].shape[
 of hardcoding it — no new parameter needed, reproduces the original 8-class case exactly since
 that's still what a 8-class net outputs.
 
+## 16. `dataloader/utils.py`, `main.py` -- federated ("distributed") eval used one shared
+    testloader for every client, not each client's own held-out data
+
+Discovered 2026-07-31 investigating suspiciously weak/flat RMSE/PCC across the whole FL sweep.
+`main.py`'s `client_fn`/`client_fn_root`/`client_fn_BN`/`client_fn_BN_Root` all passed a single
+`testloader` object (built once in `load_datasets`) to every client. Since `client.evaluate()`
+(`client/default.py`, `client/fedBN.py`, `client/fedRoot.py`) is called on the same aggregated
+global parameters for every client in a given round, this meant every client's
+`clientwise/results{cid}.txt` row was computing the exact same eval on the exact same data —
+confirmed empirically (byte-identical files across all clients in a completed 5-client run).
+Beyond making the per-client logs meaningless, this also means the *federated* (distributed)
+metric that `run_strategy` reports to `{clients}_{rounds}_{epochs}_{aug}_decentral.csv`
+(`history.losses_distributed`/`metrics_distributed`, aggregated via each strategy's
+`aggregate_evaluate`) was really a repeated centralized eval, not a genuine federated
+per-client evaluation — the vendor's own PCC definition ("per action, per client, then
+averaged", see `existing_fcl_paper_confidential.txt`) was never actually being computed.
+
+Fixed in `dataloader/utils.py`'s `load_datasets(...)`: after building the pooled `testset`
+(unchanged, still returned as `testloader` for the separate centralized `evaluate_fn`), it's
+now also partitioned per client — using the same `group_col` groups as the trainset when
+`group_col` is given (by-robot/by-room), else a matching `random_split` (iid/within-robot) —
+into a new `testloaders` list, returned alongside `testloader`
+(`load_datasets` now returns `(trainloaders, testloaders, testloader, y_labels,
+data_permutation)`, one extra element). `main.py`'s four `client_fn*` closures now pass
+`testloaders[int(cid)]` instead of the shared `testloader`; all `load_datasets(...)` call
+sites updated to unpack the new 5-tuple. `main_fcl.py` (Axis A path) and `transfer_eval.py`
+still call `load_datasets` but only ever consumed the pooled `testloader` (FCL's task-boundary
+cumulative eval and the transfer-learning zero-shot/finetune eval are both intentionally
+centralized, not per-client) — both updated to just discard the new `testloaders` return value,
+no behavior change there. Only the plain-FL benchmark's federated evaluation semantics change;
+FCL/transfer-learning are unaffected. This invalidates all FL-sweep results collected before
+this fix (RMSE/PCC values will differ once each client evaluates on its own held-out slice).
+
+## 17. `server/strategies.py`, `main.py` -- `FedOptAdamStrategy` never actually ran FedAdam
+
+Discovered 2026-07-31 in the same investigation. `FedOptAdamStrategy(fl.server.strategy.FedAvg)`
+defined a custom `aggregate(self, reports)` method intending to implement server-side
+Adam-style aggregation, but Flower's `Strategy` interface calls `aggregate_fit(self,
+server_round, results, failures)` (confirmed against the installed `flwr==1.12.0` source) —
+`aggregate` was never called by the framework, so this class silently fell through to its
+parent `FedAvg.aggregate_fit`, i.e. plain FedAvg aggregation, for every `FedOptAdam` and
+`FedRoot-FedOptAdam` run. Not introduced by the OfficeDB adaptation — confirmed identical on
+`origin/main`, a pre-existing vendor bug that just happened to surface here.
+
+Fixed by making `FedOptAdamStrategy` subclass `fl.server.strategy.FedAdam` (Reddi et al. 2020)
+directly instead of hand-rolling the aggregation — the dead `aggregate` method is deleted;
+`aggregate_fit` is now flwr's own correct, tested implementation. The class's
+`aggregate_evaluate` override (weighted-mean of `avg_pearson_score`/`avg_rmse`, needed so
+`run_strategy`'s CSV writer keeps working) is unchanged. Chosen over hand-fixing the original
+formula (which had no discoverable correctness precedent anyway — no momentum/beta state, wrong
+`results` structure assumption, wrong return shape) per explicit user direction to default to
+the simplest, best-tested option when there's no working precedent to preserve.
+
+flwr's `FedOpt`/`FedAdam` base class requires an explicit `initial_parameters` kwarg (unlike
+`FedAvg`/`FedProx`, which default it to `None` and bootstrap from the first client). Both of
+`main.py`'s `FedOptAdamStrategy(...)` construction sites (plain-FL and FedRoot-FedOptAdam) now
+pass one explicitly: `get_parameters(net)` for plain-FL (matches `client_fn`'s full-model
+`get_parameters`/`set_parameters`), `get_parameters(net.conv_module)` for FedRoot (matches
+`client_fn_root`'s root-submodule-only `get_parameters` in `client/fedRoot.py`) — using the
+wrong one would silently produce a shape mismatch against what clients actually return.
+Also invalidates all `FedOptAdam`/`FedRoot-FedOptAdam` results collected before this fix (they
+were really running FedAvg/FedRoot-FedAvg).
+
+## 18. `pretrain.py`, `dataloader/utils.py` -- pretrain never honored a leakage-safe Split
+    column, and trained/evaluated on the identical slice
+
+Discovered 2026-07-31 while scoping the single-robot office<->home domain-transfer experiment
+(`docs/domain_transfer_officedb_to_mannersdbplus.md`). `pretrain.py` always called
+`load_datasets_pretrain`, which ignores any pre-built `Split` column entirely: it does its own
+random-permutation shuffle and carves off a `split` (default 0.33) fraction as
+`data_images_test`, then `run()` reassigns that same variable name (`data`) and passes it as
+*both* `train_loader` (to `train()`) and `testloader` (to `test()`) -- i.e. every pretrain run,
+including every checkpoint produced so far for the FCL/LGR path, trained and "evaluated" on the
+exact same ~33% slice, and never touched `data/splits/*.csv`'s actual 80/10/10 train/val/test
+assignment at all. Harmless for pretrain's original purpose (just warming up a checkpoint for
+FedLGR's LGR mechanism, not itself a reported result), but wrong for the domain-transfer
+experiment's OfficeDB-side and MANNERSDBPlus-side pretraining, which need a real, leakage-safe
+train-only fit -- reusing an already-tested split mechanism (`load_datasets`'s `split_col`,
+same one `main.py`/`transfer_eval.py` already use) rather than inventing a new one.
+
+Fixed by adding an optional `--split_col` arg to `pretrain.py`: when given, it calls
+`load_datasets(num_clients=1, ..., split_col=args.split_col)` instead, training on
+`trainloaders[0]` (Split=='train' rows only) and evaluating the printed sanity-check numbers on
+the real held-out `testloader` (Split=='test' rows). Omitting `--split_col` reproduces the
+original behavior exactly (needed for any caller without a real split column, e.g. plain
+MANNERS-DB). `fedlgr_officedb/pretrain_officedb.py` now always passes `--split_col Split` for
+OfficeDB/MANNERSDBPlus data, since both have one. This changes the checkpoint
+`pretrain_officedb.py`'s default (pooled, no `--robot`) invocation produces too -- harmless
+since FCL Axis A (the only consumer) hasn't been run against a real checkpoint yet.
+
+## 19. `server/strategies.py`, `main.py` -- FedAdam applied wholesale corrupts BatchNorm
+    running_var, at any `eta`
+
+Discovered 2026-07-31 smoke-testing item 17's fix: `FedAvg`/`FedOptAdam` by-robot smoke test
+(`--rounds 1 --epochs 1`) evaluated fine at round 0 (loss 8.36, using the freshly-passed
+`initial_parameters`) but produced NaN loss/RMSE/PCC from round 1 on, for both plain
+`FedOptAdam` and `FedRoot-FedOptAdam`. Root cause: flwr's `FedAdam.aggregate_fit` (see item 17)
+applies its Adam-normalized update to *every* entry of the flat parameter list returned by
+`get_parameters(...)`, with no concept of which entries are trainable weights vs. BatchNorm's
+`running_mean`/`running_var`/`num_batches_tracked` buffers. `running_var` must stay
+non-negative; Adam's per-parameter update magnitude is normalized to ~`eta` regardless of
+`eta`'s size (that's what the normalization is for), so "just use a smaller eta" doesn't
+actually fix this — confirmed empirically against a fresh `MobileNet(num_classes=9)` state_dict
+(53 `running_var` buffers, real min value 0.0007): `eta=0.1` pushed 49/53 negative,
+`eta=0.0001` (1000x smaller than flwr's own default) still pushed 12/53 negative. A negative
+`running_var` hits `sqrt(var + eps)` in the very next BatchNorm forward pass and produces NaN
+network-wide.
+
+Fixed by splitting `FedOptAdamStrategy.aggregate_fit` (`server/strategies.py`) into two paths
+per parameter index: Adam-normalized for trainable weights (same math as flwr's `FedAdam`,
+reimplemented directly against `self.m_t`/`self.v_t`/`self.eta`/`self.beta_1`/`self.beta_2`/
+`self.tau`, which `FedAdam.__init__` already sets up), plain weighted-average (via
+`fl.server.strategy.FedAvg.aggregate_fit`, called directly to bypass `FedAdam`/`FedOpt` in the
+MRO) for BatchNorm buffers — a weighted average of already-non-negative values can't produce a
+negative result, unlike an unconstrained Adam step. Which indices are buffers is determined by
+a new `bn_buffer_mask(state_dict_keys)` helper (name-matches `running_mean`/`running_var`/
+`num_batches_tracked`), computed once in `main.py` from the same `net.state_dict()` (plain FL)
+or `net.conv_module.state_dict()` (FedRoot) order used to build `initial_parameters`, and passed
+to `FedOptAdamStrategy`'s new `buffer_mask` constructor kwarg (default `None`, reproducing
+flwr's plain wholesale `FedAdam` exactly — only this repo's two `FedOptAdamStrategy(...)`
+construction sites in `main.py` pass a real mask).
+
+Re-smoke-tested (by-robot, `--rounds 1 --epochs 1`): no more NaN for either `FedOptAdam` or
+`FedRoot-FedOptAdam`, but plain `FedOptAdam`'s round-1 loss still blew up to ~261 (vs. round 0's
+8.36, and vs. `FedAvg`'s comparable round-1 loss of ~0.81) even with buffers excluded —
+flwr's `FedAdam` defaults (`eta=0.1`, `tau=1e-9`) are still too aggressive a server step for
+this deep CNN's *trainable* weights, not just its BatchNorm buffers. Adam's per-parameter
+update magnitude is normalized to ~`eta` independent of the true delta scale, so `eta=0.1`
+means every one of ~2M parameters shifts by up to ±0.1 in a single server step regardless of
+how much the clients actually moved locally. Fixed by passing `eta=0.01, tau=1e-3` at both
+`FedOptAdamStrategy(...)` construction sites in `main.py` — Reddi et al. 2020's own
+image-classification settings, not the simpler-task defaults flwr ships. Re-smoke-tested again:
+`FedOptAdam` round 1 loss 9.05 (close to round 0's 8.36, a stable small step, not a 30x
+explosion), `FedRoot-FedOptAdam` round 1 loss 0.60 (comparable magnitude to `FedAvg`'s 0.60-0.89
+range). Note `FedOptAdam`'s round-1 loss barely improving on round 0 (8.36 -> 9.05) is expected,
+not a remaining bug: unlike `FedAvg` (which directly adopts the average of clients' fully
+locally-trained weights each round), `FedAdam`'s server step is deliberately decoupled from the
+raw magnitude of client progress -- it's supposed to move cautiously per round and build
+momentum (`self.m_t`) over many rounds, so 1-round smoke-test numbers aren't comparable to
+`FedAvg`'s in isolation; the real sweep's 5 rounds should show it catching up.
+
+## 20. `dataloader/utils.py` -- every real-image `DataLoader` gained `num_workers=NUM_WORKERS`
+
+Made on the `fedlgr_officedb_gpu` branch/worktree while diagnosing why a real-data GPU smoke
+test (`fedlgr_officedb.run_fl`, ampere, `--processor_type gpu`) never completed a single
+training epoch within 3-29 minutes, despite Ray/Flower correctly detecting the A100 and
+allocating fractional-GPU client actors. Isolated the cause with a standalone timing check
+(no Ray/GPU involved): plain `Image.open(...).convert('RGB').load()` over 100 real
+OFFICE-MANNERSDB images took ~85-115ms/image (both on the login node and, confirmed separately,
+on an ampere compute node via `srun` -- so this is shared Lustre-backend contention, not a
+login-node-only artifact). Every `DataLoader(...)` wrapping `CustomDataset` (which does this
+`Image.open` per sample in `__getitem__`, lazily) previously omitted `num_workers`, defaulting
+to `0` -- fully synchronous, single-process loading with no prefetching, so this I/O cost was
+paid serially against the training loop rather than overlapped with GPU/CPU compute. Added a
+module-level `NUM_WORKERS = 2` constant and threaded `num_workers=NUM_WORKERS` into all 7 real-
+image `DataLoader` call sites (the two in-memory-tensor `DataLoader`s in the top-level
+`utils.py`'s `predict`/`predict_gen`, used for LGR's generative-replay pseudo-samples, do no
+disk I/O and were left unchanged). `NUM_WORKERS=2` is a conservative, un-tuned starting value
+chosen to fit the smallest per-client CPU budget in use (4 CPUs/client on GPU jobs, see
+`fedlgr_officedb/slurm/submit_fl_sweep.py`'s `COMPUTE` dict) while leaving headroom on the main
+process -- purely a performance change, does not affect training results (same data, same
+order via each call's existing `shuffle=...`, just loaded by worker subprocesses instead of the
+main process). Applies equally to CPU and GPU runs (the bottleneck is disk I/O, not
+processor type) -- worth carrying back to the `fedlgr_officedb` (CPU) branch too once confirmed.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB
