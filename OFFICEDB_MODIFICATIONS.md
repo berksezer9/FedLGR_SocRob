@@ -339,6 +339,19 @@ expected ~3x wall-clock speedup per FL round. Does not affect the already-runnin
 submitted after the image is rebuilt and repushed. `vertex/gce_submit_job.py` callers should now
 pass `--num_cpus <machine's vCPU count>` alongside the module args.
 
+## 15. `utils.py` -- `predict_gen_distil` hardcoded 8-class reshape
+
+Discovered 2026-07-31: every FedDistill/FedRoot-FedDistill job in the FL sweep (8/8 run so
+far) crashed right after teacher-model pretraining with `ValueError: cannot reshape array of
+size 216000 into shape (24000,8)`. `predict_gen_distil` (used only by the FedDistill teacher's
+soft-label generation step, `dataloader/utils.py`'s `load_datasets(..., distil=True)`) reshaped
+the teacher's stacked batch outputs to a hardcoded `8` columns — a MANNERS-DB holdover that
+item 1's `num_classes` param never reached (this function takes the trained `net` directly, not
+`args.num_classes`). OfficeDB's 9-class head produces `216000 / 24000 = 9` columns, not 8.
+Fixed by reading the class count off the actual model output (`outputs[0].shape[-1]`) instead
+of hardcoding it — no new parameter needed, reproduces the original 8-class case exactly since
+that's still what a 8-class net outputs.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

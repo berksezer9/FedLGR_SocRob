@@ -297,7 +297,8 @@ def predict_gen_distil(net, trainloader, DEVICE, batch_size=16):
 	# 		for i in range(len(outputs)):
 	# 			new_pairs.append((inputs[i], outputs[i]))
 	# return DataLoader(CustomOutputDataset(new_pairs), batch_size=batch_size, shuffle=True)
-	return numpy.asarray(outputs).reshape((len(trainloader) * batch_size, 8))
+	num_classes = outputs[0].shape[-1]
+	return numpy.asarray(outputs).reshape((len(trainloader) * batch_size, num_classes))
 
 
 def get_eval_fn(net, testloader, y_labels, DEVICE):
