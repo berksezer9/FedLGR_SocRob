@@ -23,6 +23,27 @@ def bn_buffer_mask(state_dict_keys) -> List[bool]:
 	return [any(tag in k for tag in ("running_mean", "running_var", "num_batches_tracked"))
 	        for k in state_dict_keys]
 
+class RoundFailedError(RuntimeError):
+	"""Raised when every client failed/timed out in a round (OFFICEDB_MODIFICATIONS.md
+	item 22): a hard stop instead of Flower's default (silently return None/{}
+	and let the simulation carry on to the next round with a no-op). Added
+	after observing that a hung round (see FL_ROUND_TIMEOUT, main.py/
+	main_fcl.py) doesn't recover on its own -- the same 0-results outcome
+	repeated on the very next round too -- so letting the simulation continue
+	just burns the rest of the job's wall-time logging meaningless rounds
+	instead of failing fast and visibly (non-zero exit code, easy to detect
+	via sacct/grep and retry) the first time it happens."""
+
+
+def _require_results(results, failures, phase: str, server_round: int) -> None:
+	if not results:
+		raise RoundFailedError(
+			f"{phase} round {server_round}: 0/{len(results) + len(failures)} clients "
+			f"returned a result (all {len(failures)} failed/timed out) -- aborting instead "
+			f"of continuing with a no-op round. See OFFICEDB_MODIFICATIONS.md item 22."
+		)
+
+
 def weighted_avg(results: List[Tuple[int, float, Optional[float]]]) -> float:
 	"""Aggregate evaluation results obtained from multiple clients."""
 	num_total_evaluation_examples = sum([num_examples for num_examples, _ in results])
@@ -32,15 +53,18 @@ def weighted_avg(results: List[Tuple[int, float, Optional[float]]]) -> float:
 
 
 class FedAvgWithAccuracyMetric(fl.server.strategy.FedAvg):
+	def aggregate_fit(self, server_round, results, failures):
+		_require_results(results, failures, "fit", server_round)
+		return super().aggregate_fit(server_round, results, failures)
+
 	def aggregate_evaluate(self,
 						   rnd: int,
 						   results: List[Tuple[ClientProxy, EvaluateRes]],
 						   failures: List[BaseException],
 						   ) -> Tuple[Optional[float], Dict[str, Scalar]]:
 		"""Aggregate evaluation losses using weighted average."""
-		
-		if not results:
-			return None, {}
+
+		_require_results(results, failures, "evaluate", rnd)
 		# Do not aggregate if there are failures and failures are not accepted
 		if not self.accept_failures and failures:
 			return None, {}
@@ -54,6 +78,10 @@ class FedAvgWithAccuracyMetric(fl.server.strategy.FedAvg):
 
 
 class FedProxWithAccuracyMetric(fl.server.strategy.FedProx):
+	def aggregate_fit(self, server_round, results, failures):
+		_require_results(results, failures, "fit", server_round)
+		return super().aggregate_fit(server_round, results, failures)
+
 	def aggregate_evaluate(
 		self,
 		rnd: int,
@@ -61,8 +89,7 @@ class FedProxWithAccuracyMetric(fl.server.strategy.FedProx):
 		failures: List[BaseException],
 	) -> Tuple[Optional[float], Dict[str, Scalar]]:
 		"""Aggregate evaluation losses using weighted average."""
-		if not results:
-			return None, {}
+		_require_results(results, failures, "evaluate", rnd)
 		# Do not aggregate if there are failures and failures are not accepted
 		if not self.accept_failures and failures:
 			return None, {}
@@ -120,6 +147,7 @@ class FedOptAdamStrategy(fl.server.strategy.FedAdam):
 		0, NaN loss/RMSE/PCC from round 1 on). See OFFICEDB_MODIFICATIONS.md item
 		19. `buffer_mask=None` (default) reproduces flwr's plain FedAdam exactly.
 		"""
+		_require_results(results, failures, "fit", server_round)
 		if not self.buffer_mask:
 			return super().aggregate_fit(server_round, results, failures)
 
@@ -160,8 +188,7 @@ class FedOptAdamStrategy(fl.server.strategy.FedAdam):
 		failures: List[BaseException],
 	) -> Tuple[Optional[float], Dict[str, Scalar]]:
 		"""Aggregate evaluation losses using weighted average."""
-		if not results:
-			return None, {}
+		_require_results(results, failures, "evaluate", rnd)
 		# Do not aggregate if there are failures and failures are not accepted
 		if not self.accept_failures and failures:
 			return None, {}
@@ -170,5 +197,5 @@ class FedOptAdamStrategy(fl.server.strategy.FedAdam):
 			[(evaluate_res.num_examples, evaluate_res.metrics['avg_pearson_score']) for _, evaluate_res in results])
 		rmse = weighted_avg(
 			[(evaluate_res.num_examples, evaluate_res.metrics['avg_rmse']) for _, evaluate_res in results])
-		
+
 		return loss_aggregated, {'avg_pearson_score': pcc_aggregated, 'avg_rmse':rmse}

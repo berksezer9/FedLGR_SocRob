@@ -1,4 +1,5 @@
 import argparse
+import os
 import ray
 import flwr as fl
 import torch.nn as nn
@@ -40,6 +41,17 @@ def auto_garbage_collect(pct=80.0):
     return
 
 
+# Bounds how long the Flower/Ray VirtualClientEngine will wait for a single
+# round's client fit/evaluate calls before giving up (OFFICEDB_MODIFICATIONS.md
+# item 22). Unset (None) reproduces the original unbounded-wait behavior
+# exactly. Set via FL_ROUND_TIMEOUT (seconds) -- see that item for why this
+# exists: an unexplained Ray/Flower VCE hang (client actors spawn, zero
+# progress, no error) was observed on both CPU and GPU, at multiple client
+# counts, with no root cause found -- without a round_timeout, a hung round
+# silently burns the entire job's wall-time budget for zero results.
+ROUND_TIMEOUT = float(os.environ["FL_ROUND_TIMEOUT"]) if os.environ.get("FL_ROUND_TIMEOUT") else None
+
+
 def run_strategy(strategy, strategy_name, client_function, clients, rounds, epochs, output, aug, ray_init_args, client_res):
     """
 	   Running all strategies defined under "strategy"
@@ -48,7 +60,7 @@ def run_strategy(strategy, strategy_name, client_function, clients, rounds, epoc
     history = fl.simulation.start_simulation(
         client_fn=client_function,
         num_clients=clients,
-        config=fl.server.ServerConfig(num_rounds=rounds),
+        config=fl.server.ServerConfig(num_rounds=rounds, round_timeout=ROUND_TIMEOUT),
         strategy=strategy,
         ray_init_args=ray_init_args,
         client_resources=client_res)

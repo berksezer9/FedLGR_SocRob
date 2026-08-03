@@ -517,6 +517,130 @@ order via each call's existing `shuffle=...`, just loaded by worker subprocesses
 main process). Applies equally to CPU and GPU runs (the bottleneck is disk I/O, not
 processor type) -- worth carrying back to the `fedlgr_officedb` (CPU) branch too once confirmed.
 
+## 21. `utils.py` -- `test()` computes Pearson/RMSE/loss over the full test set, not per-batch
+
+Found 2026-08-01 investigating why ~15-20% of completed FL-sweep clientwise result files had
+`avg_pearson_score = nan` for every single round (not sporadic) -- initially suspected as a
+FedRoot-specific bug (user's original report) but confirmed empirically to hit every strategy
+equally (`FedAvg`/`FedBN`/`FedDistill`/`FedOptAdam`/`FedProx`/`FedRoot-*` all affected), so it's
+a shared metric-computation bug, not architecture-specific.
+
+Root cause: the test `DataLoader` (`dataloader/utils.py`) uses `batch_size=16` with the default
+`drop_last=False`, so whenever a client's held-out test partition size isn't a multiple of 16,
+the final batch is small (as small as 3-5 samples in practice, since OfficeDB's per-client/
+per-room/per-robot partitions rarely divide evenly). `test()` computed Pearson **per batch**
+then averaged across batches -- with OfficeDB's 1-5 discrete rating scale, a small final batch
+has a non-trivial chance that every sample shares the same rating for at least one of the 9
+actions (confirmed empirically: by-room's `Hallway` client, n=229 test rows, has a final
+5-sample batch where all 5 rows rate "Carry Drinks" and "Carry Small Objects" identically;
+`SmallOffice`'s final 3-sample batch does the same for 2 other actions). `scipy.stats.pearsonr`
+returns `nan` for a zero-variance input. The existing NaN-rescue (re-running `pearsonr` with the
+*outputs* perturbed by tiny Gaussian noise) only helps when the *predictions* are degenerate --
+it cannot fix degenerate *labels*, which is what a same-rating batch is. The resulting NaN then
+got folded into the client's overall `avg_pearson_score` via a plain, non-NaN-safe `Average()`
+(`sum(lst)/len(lst)`), so **one** degenerate batch/action silently NaN'd the client's entire
+reported Pearson score. Since the test `DataLoader` isn't reshuffled between evaluation calls,
+it's the *same* small batch every round -- explaining why affected clients were NaN for all 5
+rounds, every time, regardless of strategy.
+
+Verified the mechanism by replicating `main.py`'s exact seeding (`np.random.seed(1024)`, set at
+module import before any other RNG-consuming call) and `dataloader/utils.py`'s exact
+`data.sample(frac=1)` calls against the real `office_fl/all_data.csv`, offline: reproduced the
+precise Hallway/SmallOffice final-batch rows above bit-for-bit. Also checked whether this is a
+genuine data problem (e.g. a room with near-constant ratings): full-partition std for every
+room/every action is healthy (~1.2-1.4 on the 1-5 scale) -- this is purely a last-batch sampling
+artifact, not a real label-quality issue.
+
+Fixed by changing `test()` to accumulate every batch's `(labels, outputs)` across the whole
+`testloader` first, then compute loss/RMSE/Pearson once over the full concatenated test set,
+instead of per-batch-then-averaged. This also resolves the open question flagged in
+`docs/fedlgr_officedb_experiments.md`'s "Results quality" section ("whether the per-batch...
+Pearson computation... adds meaningful noise" -- it does, in the form of both this NaN failure
+mode and generally noisier per-batch estimates than a single full-set correlation). Single
+source of truth: `get_eval_fn`/`get_eval_fn_cl`/`get_eval_fn_bn` and both FL/FCL client
+`evaluate()` methods (`client/default.py`, `client/fedBN.py`, `client/fedRoot.py`, `CL/
+default.py`) all call this same `test()`, so the fix covers FL, FCL, and centralized eval in one
+place -- no other `pearsonr` call site exists in the vendor code.
+
+**Every already-completed FL Priority-1 (bugfix rerun) result for a client whose partition hits
+this last-small-batch case is affected** -- that client's `avg_pearson_score` was `nan` (not
+just noisy) for every round, in every strategy that used that partition. Confirmed affected
+(via `grep ",nan," clientwise/results*.txt`): by-room's client 2 (`Hallway`) and client 4
+(`SmallOffice`) across all 5 by-room strategies from the `20260731_174918` submission batch;
+within-robot-2's client 0 across multiple robots/strategies from several submission batches
+(same root cause -- `within-robot-2`'s `random_split(..., manual_seed(42))` partition happens to
+leave a small last test batch for that client too). These need a rerun under the fixed code to
+get a real (non-NaN) `avg_pearson_score` for the affected client -- the fix doesn't retroactively
+repair already-written result files, only future runs. Not yet re-smoke-tested against real data
+as of this writing -- do that before resubmitting the affected jobs.
+
+## 22. `main.py`/`main_fcl.py` -- optional `FL_ROUND_TIMEOUT` env var bounds each round
+
+Added 2026-08-01 after an unexplained Ray/Flower `VirtualClientEngine` hang: client actors
+spawn cleanly (Ray/CUDA init succeeds, `configure_fit` samples the right number of clients),
+then zero progress -- no epoch print, no error, no crash -- until the job's wall-time limit
+kills it. Confirmed reproducible on **both** CPU and GPU, at `n_clients=2` *and* `n_clients=3`,
+always with `strategy_cl=EWC` (no other strategy tested yet) -- see the FCL Axis A GPU debug
+jobs `32509212`/`32537651` (both hung, `n_clients=2`) and the FCL Axis A CPU smoke test
+`32538963` (hung, `n_clients=3`, i.e. the config a different session had concluded was
+"confirmed working" based on one earlier successful GPU run -- that conclusion doesn't hold up;
+this looks like an intermittent/racy hang, not one deterministically tied to client count).
+Root cause **not found** -- ruled out (by the earlier GPU debugging session): no `n_clients=2`
+special-case in the vendored app or in Flower 1.12.0's own `VirtualClientEngine`, no
+degenerate/empty per-client data split. `vendor/FedLGR_SocRob/dataloader/utils.py`'s missing
+`--num_cpus` in the two FCL Axis A smoke-test sbatch scripts (causing Ray to auto-detect the
+whole node's CPU count instead of the Slurm-allocated share) was considered but ruled out as
+the sole cause: the GPU debug rerun (`32537651`) passed `--num_cpus` correctly matching its
+Slurm allocation and still hung.
+
+Since the underlying cause is unresolved, added a defensive/diagnostic bound instead: both
+`main.py` and `main_fcl.py` now read `FL_ROUND_TIMEOUT` (seconds) and pass it as
+`fl.server.ServerConfig(..., round_timeout=...)`. Unset (the default, `None`) reproduces the
+original unbounded-wait behavior exactly -- this does not change any already-passing job's
+behavior.
+
+**`round_timeout` alone was NOT enough -- verified empirically, and the actual behavior was
+worse than expected, not just "not a fix".** Tested it directly against the known-hanging config
+(CPU, `n_clients=3`, EWC, `FL_ROUND_TIMEOUT=90`, job `32577187`'s debug rerun): once the 90s
+timeout hit, Flower did NOT raise/abort -- `flwr.simulation.ray_transport.ray_actor.py`'s
+`get_client_result` raises a `TimeoutError` per client, but `server.py`'s `fit_round`/
+`evaluate_round` catch that as a per-client *failure* (not a fatal error) and calls
+`strategy.aggregate_fit`/`aggregate_evaluate` anyway with `results=[]`. The stock
+(and this repo's, pre-this-fix) strategies all did `if not results: return None, {}` --
+i.e. **silently proceed to the next round with a no-op**, rather than stopping. Confirmed via
+the debug log: round 0 AND round 1 both logged `aggregate_fit: received 0 results and 3
+failures` back-to-back -- once the underlying hang triggers, it does not recover on its own, so
+without a hard stop the simulation would have ground through all 15 rounds doing nothing,
+producing a completed-looking job (exit 0, full round count) with meaningless output for
+however many rounds were affected -- arguably worse than the original silent hang, since a
+0/15-real-rounds job wouldn't obviously look broken without checking the log for this exact
+message.
+
+**Real fix**: `server/strategies.py` -- every `aggregate_fit`/`aggregate_evaluate` override
+(`FedAvgWithAccuracyMetric`, `FedProxWithAccuracyMetric`, `FedOptAdamStrategy`) now calls a
+shared `_require_results(results, failures, phase, round)` helper first, which raises
+`RoundFailedError` (`RuntimeError` subclass) the moment `results` is empty, instead of the old
+`if not results: return None, {}`. `FedAvgWithAccuracyMetric`/`FedProxWithAccuracyMetric` didn't
+previously override `aggregate_fit` at all (relied on flwr's own `FedAvg`/`FedProx` base, which
+has the same silent-return behavior) -- added the override there too, purely to insert this
+check before delegating to `super().aggregate_fit(...)`. An exception raised inside
+`aggregate_fit`/`aggregate_evaluate` is not caught anywhere in flwr's `Server.fit()` main loop
+(confirmed by reading `flwr/server/server.py` -- the per-round call isn't wrapped in a
+try/except), so it propagates all the way out of `fl.simulation.start_simulation(...)` and
+crashes the whole `python -m fedlgr_officedb.run_fcl`/`run_fl` process with a non-zero exit --
+real fail-fast, visible in `sacct` as FAILED, no log-grepping needed to detect it. Only fires
+when `results` is completely empty (every client failed/timed out that round) -- every
+previously-successful run had non-empty `results`, so this changes nothing for already-passing
+jobs, only converts "silently degrade for the rest of the job" into "stop immediately." Applies
+to FL and FCL both (same strategy classes, same file). `FL_ROUND_TIMEOUT` is still what makes
+`results` empty in the first place within a bounded time instead of hanging forever -- both
+pieces (the timeout AND the hard-stop-on-empty-results) are needed together.
+
+Still a mitigation, not a fix for the underlying hang -- revisit if/when the real root cause is
+found (a live `py-spy`/`gdb` stack trace of a hung actor is the logical next step, not yet done
+-- `py-spy` isn't installed and the compute nodes have no internet access to install it there;
+would need installing from the login node into the shared `.venv` first).
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

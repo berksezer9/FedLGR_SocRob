@@ -26,6 +26,12 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+# See main.py's identical ROUND_TIMEOUT for why this exists
+# (OFFICEDB_MODIFICATIONS.md item 22) -- unset (None) reproduces the
+# original unbounded-wait behavior exactly.
+ROUND_TIMEOUT = float(os.environ["FL_ROUND_TIMEOUT"]) if os.environ.get("FL_ROUND_TIMEOUT") else None
+
+
 def run_strategy(strategy, strategy_name, coeff, client_fn, clients, rounds, epochs, output, aug, ray_init_args,
                  client_res, n_tasks=2):
     # Generalizes vendor's original hardcoded 2-task Loss1/RMSE1/PCC1/Loss2/RMSE2/PCC2
@@ -36,7 +42,7 @@ def run_strategy(strategy, strategy_name, coeff, client_fn, clients, rounds, epo
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=int(clients),
-        config=fl.server.ServerConfig(num_rounds=int(rounds)),  # Just three rounds
+        config=fl.server.ServerConfig(num_rounds=int(rounds), round_timeout=ROUND_TIMEOUT),  # Just three rounds
         strategy=strategy,
         ray_init_args=ray_init_args,
         client_resources=client_res,

@@ -200,12 +200,31 @@ def test(net, testloader, y_labels, DEVICE, active_idx=None):
 	# OFFICEDB_MODIFICATIONS.md). y_labels must already correspond 1:1 to
 	# active_idx (i.e. len(y_labels) == len(active_idx)) when given; None
 	# (default) reproduces the original full-output-space behaviour exactly.
+	#
+	# Metrics are computed once over the FULL concatenated test set, not
+	# per-batch-then-averaged (OFFICEDB_MODIFICATIONS.md item 21): the old
+	# per-batch Pearson computation went NaN whenever a single batch (most
+	# often the final, sub-batch_size batch a non-drop_last test DataLoader
+	# produces) happened to have zero-variance labels for one action --
+	# common with OfficeDB's small per-client partitions and 1-5 discrete
+	# rating scale. The existing NaN-rescue (perturbing outputs with tiny
+	# noise) only helps when *predictions* are constant; it can't fix
+	# constant *labels*, which is what a degenerate small batch is. The
+	# resulting NaN then got averaged in via a non-NaN-safe Average(),
+	# silently poisoning that client's ENTIRE avg_pearson_score, every
+	# round (the test DataLoader isn't reshuffled between rounds, so it's
+	# the same degenerate batch every time). Confirmed empirically: e.g.
+	# by-room's Hallway client (n=229 test rows, batch_size=16) has a final
+	# 5-sample batch where all 5 rows rate "Carry Drinks"/"Carry Small
+	# Objects" identically. Full-partition variance is healthy everywhere
+	# (std ~1.2-1.4 on the 1-5 scale) -- computing over the whole held-out
+	# set instead of noisy <=16-sample chunks removes the NaN risk
+	# entirely, not just this one instance of it.
 	criterion = torch.nn.MSELoss()
 	RMSE = RMSELoss()
-	pearson = {y_labels[i]: [] for i in range(len(y_labels))}
-	rmse, total, loss = [], [], []
 	net.eval()
 	net = net.to(DEVICE)
+	all_labels, all_outputs = [], []
 	with torch.no_grad():
 		for features, labels in testloader:
 			features, labels = features.to(DEVICE), labels.to(DEVICE)
@@ -213,9 +232,6 @@ def test(net, testloader, y_labels, DEVICE, active_idx=None):
 			if active_idx is not None:
 				outputs = outputs[:, active_idx]
 				labels = labels[:, active_idx]
-			loss.append(criterion(outputs, labels).item())
-			rmse.append(RMSE(outputs, labels).item())
-			# total += labels.size(0)
 			if torch.isnan(features).any():
 				print("-----------------------------features")
 			if torch.isnan(labels).any():
@@ -223,18 +239,23 @@ def test(net, testloader, y_labels, DEVICE, active_idx=None):
 			if torch.isnan(outputs).any():
 				print("-----------------------------outputs")
 
-			labels = labels.cpu().numpy()
-			outputs = outputs.cpu().numpy()
+			all_labels.append(labels.cpu())
+			all_outputs.append(outputs.cpu())
 
-			for i in range(len(y_labels)):
-				if len(labels[:, i]) > 1 and len(outputs[:, i]) > 1:
-					temp = pearsonr(labels[:, i], outputs[:, i])[0]
-					if math.isnan(temp):
-						temp = pearsonr(labels[:, i], np.random.normal(outputs[:, i], 0.0000001))[0]
-					pearson[y_labels[i]].append(temp)
-	for i in pearson.keys():
-		pearson[i] = Average(pearson[i])
-	return Average(loss), Average(list(pearson.values())), Average(rmse)
+	all_labels = torch.cat(all_labels, dim=0)
+	all_outputs = torch.cat(all_outputs, dim=0)
+	loss = criterion(all_outputs, all_labels).item()
+	rmse = RMSE(all_outputs, all_labels).item()
+
+	labels_np = all_labels.numpy()
+	outputs_np = all_outputs.numpy()
+	pearson = {}
+	for i in range(len(y_labels)):
+		temp = pearsonr(labels_np[:, i], outputs_np[:, i])[0]
+		if math.isnan(temp):
+			temp = pearsonr(labels_np[:, i], np.random.normal(outputs_np[:, i], 0.0000001))[0]
+		pearson[y_labels[i]] = temp
+	return loss, Average(list(pearson.values())), rmse
 
 
 # return loss, pcc, rmse
