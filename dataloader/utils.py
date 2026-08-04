@@ -259,6 +259,41 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 	return trainloaders, testloaders, testloader, y_labels, data_permutation
 
 
+def load_val_loader(path, batch_size=16, action_cols=None, extra_cols=None, split_col='Split'):
+	# Standalone val-split loader for early-stopping-based checkpoint
+	# selection (OFFICEDB_MODIFICATIONS.md item 23). Deliberately independent
+	# of load_datasets()'s train/test return contract -- adding a val loader
+	# to that function's return tuple would require every existing call site
+	# (main.py, run_fl.py, transfer_eval.py, pretrain.py) to be updated to
+	# unpack one more value, for a purely additive, opt-in feature only the
+	# new early-stopping path needs. 'val' rows already exist in every
+	# prepared OfficeDB/MANNERSDBPlus dataset (data/splits/*.csv's 80/10/10
+	# split) but were never consumed anywhere before this -- see the comment
+	# on load_datasets()'s split_col branch above. Returns None if the data
+	# has no split_col column or no rows labeled 'val' (e.g. a legacy
+	# MANNERS-DB path with no 3-way split), so callers can fall back to the
+	# old fixed-epoch behavior instead of hard-failing.
+	action_cols = list(action_cols) if action_cols is not None else list(_DEFAULT_ACTION_COLS)
+	extra_cols = list(extra_cols) if extra_cols is not None else list(_DEFAULT_EXTRA_COLS)
+	label_start = 2 + len(extra_cols)
+
+	data = load_images(path, action_cols=action_cols, extra_cols=extra_cols)
+	if split_col not in data.columns:
+		return None
+	data_images_val = data[data[split_col] == 'val'].reset_index(drop=True)
+	if len(data_images_val) == 0:
+		return None
+	data_images_val = data_images_val.sample(frac=1).reset_index(drop=True)
+
+	val_transform = transforms.Compose([
+		transforms.Resize((128, 128)),
+		transforms.ToTensor(),
+		transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+	])
+	valset = CustomDataset(dataframe=data_images_val, transform=val_transform, label_start=label_start)
+	return DataLoader(valset, batch_size=batch_size, num_workers=NUM_WORKERS)
+
+
 def load_datasets_pretrain(num_clients, path, split, aug=True, batch_size=16, out='', DEVICE=torch.device("cpu"),
 						   data_permutation=None, action_cols=None, extra_cols=None):
 	action_cols = list(action_cols) if action_cols is not None else list(_DEFAULT_ACTION_COLS)

@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
+import copy
 import numpy
 import torch
 import torch.optim as optim
@@ -167,6 +168,68 @@ def train(model, train_loader, epochs, DEVICE):
 			peak_ramu=max(peak_ramu, ramu.compute("TRAINING"))
 		print(f"Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(train_loader)}")
 	return peak_ramu
+
+
+def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels, max_epochs=40, patience=5):
+	# Val-loss-based early stopping + best-checkpoint selection
+	# (OFFICEDB_MODIFICATIONS.md item 23), added because the domain-transfer
+	# experiment's original fixed --epochs count had no way to tell
+	# "converged" apart from "still improving" or "already overfitting" --
+	# per-epoch training-loss logs showed Office-domain checkpoints
+	# plateauing by ~epoch 6-8 while Home-domain checkpoints were still
+	# declining at epoch 10 for the same fixed budget. Standard practice
+	# (e.g. Prechelt 1998, "Early Stopping -- But When?"): track validation
+	# loss every epoch, keep a copy of the model's weights whenever a new
+	# best is seen, and stop once `patience` epochs pass with no
+	# improvement -- the best-seen epoch is usually several epochs before
+	# the stopping point itself, not the final epoch trained.
+	#
+	# Deliberately a new function alongside train(), not a modification of
+	# it: train() is also called from run_fl.py/main_fcl.py's federated
+	# paths (per-round local training, where "epochs" means local epochs
+	# per round, not "train until convergence") -- those call sites are
+	# unaffected by this addition.
+	criterion = nn.MSELoss()
+	optimizer = optim.Adam(model.parameters(), lr=0.001)
+	model.to(DEVICE)
+
+	best_val_loss = float('inf')
+	best_state = None
+	best_epoch = 0
+	epochs_without_improvement = 0
+
+	for epoch in range(max_epochs):
+		model.train()
+		running_loss = 0.0
+		for images, labels in train_loader:
+			images, labels = images.to(DEVICE), labels.to(DEVICE)
+			optimizer.zero_grad()
+			outputs = model(images)
+			loss = criterion(outputs, labels)
+			loss.backward()
+			optimizer.step()
+			running_loss += loss.item()
+		train_loss = running_loss / len(train_loader)
+
+		val_loss, val_pcc, val_rmse = test(net=model, testloader=val_loader, y_labels=y_labels, DEVICE=DEVICE)
+		is_best = val_loss < best_val_loss
+		print(f"Epoch {epoch + 1}/{max_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}"
+			  f"{' (best)' if is_best else ''}")
+
+		if is_best:
+			best_val_loss = val_loss
+			best_state = copy.deepcopy(model.state_dict())
+			best_epoch = epoch + 1
+			epochs_without_improvement = 0
+		else:
+			epochs_without_improvement += 1
+			if epochs_without_improvement >= patience:
+				print(f"Early stopping at epoch {epoch + 1} "
+					  f"(best was epoch {best_epoch}, val loss {best_val_loss})")
+				break
+
+	model.load_state_dict(best_state)
+	return best_epoch, best_val_loss
 
 
 def pearson_correlation(labels, outputs):

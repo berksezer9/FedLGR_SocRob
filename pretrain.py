@@ -1,16 +1,30 @@
-from dataloader.utils import load_datasets_pretrain, load_datasets
+from dataloader.utils import load_datasets_pretrain, load_datasets, load_val_loader
 from models.deepLabMobileNet import Net as deepNet
 from models.MobileNet import Net as mobNet
 import torch
 import argparse
 import pickle
+import random
+import numpy as np
 #add utils from previous folder
 import sys
 sys.path.append('../')
-from utils import train, test
+from utils import train, test, train_with_early_stopping
 def Average(lst):
     return sum(lst) / len(lst)
 def run(args):
+    # Multi-seed reruns (domain-transfer single-seed-reliability check,
+    # docs/domain_transfer_officedb_to_mannersdbplus.md "Literature
+    # verification" section) need model init + DataLoader shuffling to
+    # actually vary per --seed and be reproducible for a given seed -- seed
+    # every RNG source before anything stochastic happens (data split
+    # ordering, model weight init, train/val shuffling). --seed is optional
+    # and unset by default so all prior non-seeded runs/checkpoints are
+    # unaffected.
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
     #load the datasets
     if args.processor=='cpu':
         DEVICE = torch.device('cpu')
@@ -55,6 +69,9 @@ def run(args):
             action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col)
         train_loader = trainloaders[0]
         eval_loader = testloader
+        val_loader = load_val_loader(
+            args.data, batch_size=args.batch_size, action_cols=action_cols, extra_cols=extra_cols,
+            split_col=args.split_col) if args.early_stopping else None
     else:
         # Original behavior, unchanged: no split_col means no leakage-safe
         # split is available, so fall back to load_datasets_pretrain's
@@ -66,11 +83,20 @@ def run(args):
                                                path=args.data, aug=False, DEVICE=DEVICE,
                                                action_cols=action_cols, extra_cols=extra_cols)
         eval_loader = train_loader
+        val_loader = None
+    if args.early_stopping and val_loader is None:
+        sys.exit("--early_stopping requires --split_col with 'val' rows in the data (none found)")
     for i in range(len(models)):
         model=models[i]
         model_n=names[i]
-        train(model=model, train_loader=train_loader, epochs=args.epochs, DEVICE=DEVICE)
         y_labels=list(range(args.num_classes))
+        if args.early_stopping:
+            best_epoch, best_val_loss = train_with_early_stopping(
+                model=model, train_loader=train_loader, val_loader=val_loader, DEVICE=DEVICE,
+                y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience)
+            print(f"Early-stopped at epoch {best_epoch} (val loss {best_val_loss})")
+        else:
+            train(model=model, train_loader=train_loader, epochs=args.epochs, DEVICE=DEVICE)
         a,b,c=test(net=model, testloader=eval_loader,y_labels=y_labels, DEVICE=DEVICE)
         print(a, b, c)
         with open(args.path + "/" + model_n + ".pkl", 'wb') as f:
@@ -100,6 +126,18 @@ if __name__ == "__main__":
                          help='If given and present in the data, train only on rows where this column == "train" '
                               '(load_datasets(), leakage-safe) instead of load_datasets_pretrain\'s random '
                               'split_ratio shuffle. Omit to preserve the original behavior exactly.')
+    parser.add_argument('--early_stopping', action='store_true',
+                         help='Train up to --max_epochs, evaluating a held-out "val" split (--split_col) '
+                              'after every epoch, and keep the lowest-val-loss epoch\'s weights instead of '
+                              'whatever --epochs happened to land on. Requires --split_col and \'val\' rows '
+                              'in the data. Default off: reproduces the original fixed --epochs behavior.')
+    parser.add_argument('--max_epochs', type=int, default=40,
+                         help='Epoch cap when --early_stopping (default 40; ignored otherwise)')
+    parser.add_argument('--patience', type=int, default=5,
+                         help='Early-stopping patience in epochs (default 5; ignored unless --early_stopping)')
+    parser.add_argument('--seed', type=int, default=None,
+                         help='Seed random/numpy/torch before model init and training, for multi-seed '
+                              'reruns. Default None: unseeded (original behavior, unchanged).')
     args = parser.parse_args()
 
     print("Running with following arguments:")

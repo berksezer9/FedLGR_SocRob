@@ -641,6 +641,72 @@ found (a live `py-spy`/`gdb` stack trace of a hung actor is the logical next ste
 -- `py-spy` isn't installed and the compute nodes have no internet access to install it there;
 would need installing from the login node into the shared `.venv` first).
 
+## 23. `pretrain.py`, `transfer_eval.py`, `utils.py`, `dataloader/utils.py` -- val-loss early
+stopping, replacing the domain-transfer experiment's fixed epoch counts
+
+Added 2026-08-03 for `docs/domain_transfer_officedb_to_mannersdbplus.md`'s domain-transfer
+experiment, after checking per-epoch training-loss logs from the existing fixed-10-epoch
+pretrain jobs (32487816/818, 32688171-174): Office-domain checkpoints (all 3 robots) plateau by
+~epoch 6-8, but Home-domain checkpoints (all 3 robots) were still declining at epoch 10 (Nao,
+Pepper) or had just turned back upward (PR2, more consistent with early overfitting noise than a
+clean plateau) -- meaning a fixed epoch count picked one number that under-trains Home and,
+plausibly, over-trains Office, conflating "domain is harder" with "domain needed more/fewer
+epochs" in the transfer-eval comparison. User asked for the literature-standard fix instead of
+guessing a bigger fixed number: track validation loss every epoch and keep the lowest-val-loss
+epoch's weights (early stopping with patience), not whatever epoch a fixed budget happens to
+land on -- e.g. Prechelt 1998, "Early Stopping -- But When?".
+
+**`dataloader/utils.py`**: new `load_val_loader(path, ...)` function, standalone rather than
+added to `load_datasets()`'s return tuple -- extending that tuple would require updating every
+existing call site (`main.py`, `run_fl.py`, `transfer_eval.py`, `pretrain.py`) to unpack one more
+value for a feature only the new early-stopping path needs. Every OfficeDB/MANNERSDBPlus
+per-robot dataset already carries `Split=='val'` rows (the `data/splits/*.csv` 80/10/10 split)
+that nothing previously consumed -- `load_datasets()`'s own comment already noted this ("'val'
+rows are simply not consumed here, since this training loop... has no validation phase") and
+even had a `# valloaders = []` placeholder never wired up. Returns `None` if the data has no
+`split_col` or no `'val'` rows, so callers can fall back to the old fixed-epoch path instead of
+hard-failing (e.g. legacy MANNERS-DB paths with no 3-way split).
+
+**`utils.py`**: new `train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels,
+max_epochs=40, patience=5)`, added alongside `train()` rather than modifying it -- `train()` is
+also called from the FL/FCL per-round local-training path (`run_fl.py`/`main_fcl.py`), where
+"epochs" means local epochs per round, not "train to convergence"; those call sites are
+unaffected. Evaluates `val_loader` via the existing `test()` after every epoch, keeps a
+`copy.deepcopy`'d state_dict whenever val loss improves, stops after `patience` epochs with no
+improvement, and loads the best (not final) state_dict into `model` before returning.
+
+**`pretrain.py`/`transfer_eval.py`**: new `--early_stopping`/`--max_epochs`/`--patience` args,
+each opt-in and additive -- omitting `--early_stopping` reproduces the exact previous fixed
+`--epochs`/`--finetune_epochs` behavior. `--early_stopping` requires `--split_col` and `'val'`
+rows in the data (`pretrain.py`) or `'val'` rows in `--data` (`transfer_eval.py`); both hard-exit
+with a clear message rather than silently falling back if neither is available, since a silent
+fallback here would silently reproduce the exact problem this item exists to fix.
+
+Threaded through `fedlgr_officedb/pretrain_officedb.py` and
+`fedlgr_officedb/transfer_office_to_home.py` (our wrappers) and
+`fedlgr_officedb/slurm/domain_transfer_{pretrain,eval}.sbatch` (`EARLY_STOPPING=1` env var, plus
+`MAX_EPOCHS`/`PATIENCE`) the same way. sbatch wall-time bumped 45min/1h -> 2h each, since
+`--max_epochs 40` with early stopping can run longer than the previous fixed 10/5-epoch budgets
+if patience doesn't trigger quickly -- pure safety margin, no cost if a job finishes early.
+
+## 24. `pretrain.py` -- optional `--seed` for the domain-transfer multi-seed reliability rerun
+
+Added 2026-08-04 for `docs/domain_transfer_officedb_to_mannersdbplus.md`'s "Multi-seed
+reliability rerun" section: the item-23 early-stopped ceiling-vs-joint comparison was a single
+uncontrolled stochastic run per condition (no seed was set anywhere in this repo before this).
+Literature check (Reimers & Gurevych 2017; Bouthillier et al. 2021) found that's not sufficient
+evidence for a comparison claim, so a 5-seed rerun was needed.
+
+New `--seed` arg (default `None`, unseeded -- reproduces prior behavior exactly). When given,
+`run()` calls `random.seed`/`np.random.seed`/`torch.manual_seed` before anything stochastic
+happens (data-loader shuffling, model weight init). Placed at the very top of `run()`, before
+`load_datasets*`/`load_val_loader` and model construction, since seeding after either would leave
+that call's own randomness uncontrolled. Threaded through
+`fedlgr_officedb/pretrain_officedb.py` (`--seed`) and
+`fedlgr_officedb/slurm/domain_transfer_pretrain.sbatch` (`SEED` env var, optional). Not added to
+`transfer_eval.py`: zero-shot eval has no training-time stochasticity and aggregate PCC/RMSE are
+order-invariant, so the eval half of the pipeline needed no change.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB
