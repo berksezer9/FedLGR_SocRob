@@ -21,12 +21,25 @@ import torch
 import argparse
 import json
 import pickle
+import random
+import numpy as np
 import sys
 sys.path.append('../')
 from utils import train, test, train_with_early_stopping
 
 
 def run(args):
+    # Same rationale as pretrain.py's --seed: the checkpoint's own weights
+    # are already fixed, but the fine-tune phase still has its own
+    # stochasticity (train_loader shuffling order, and dropout if any) that
+    # a pretrain-time seed doesn't control. Seed here too so cross-domain
+    # fine-tune multi-seed reruns are reproducible per seed. Optional/unset
+    # by default -- no behavior change for prior non-seeded eval runs.
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
     DEVICE = torch.device('cuda' if args.processor == 'gpu' else 'cpu')
 
     if args.model == 'DeepLabMobileNet':
@@ -101,6 +114,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_classes', type=int, default=8)
     parser.add_argument('--action_cols', type=str, default=None)
     parser.add_argument('--extra_cols', type=str, default=None)
+    parser.add_argument('--seed', type=int, default=None,
+                         help='Seed random/numpy/torch before the fine-tune phase (multi-seed '
+                              'reliability reruns). Default None: unseeded, unchanged prior behavior.')
     args = parser.parse_args()
 
     run(args)

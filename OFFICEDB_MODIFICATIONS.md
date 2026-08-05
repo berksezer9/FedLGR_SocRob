@@ -707,6 +707,25 @@ that call's own randomness uncontrolled. Threaded through
 `transfer_eval.py`: zero-shot eval has no training-time stochasticity and aggregate PCC/RMSE are
 order-invariant, so the eval half of the pipeline needed no change.
 
+## 24b. `transfer_eval.py` -- optional `--seed`, correcting item 24's "not needed" claim for the fine-tune phase
+
+**Backfilled commit** -- this code was already written and in active use (the crossdomain
+domain-transfer multi-seed reliability rerun, `results/fedlgr_officedb/domain_transfer/
+crossdomain_seed_reliability/`, and `fedlgr_officedb/slurm/submit_crossdomain_transfer_seeds.py`,
+which explicitly calls this "transfer_eval.py's new `--seed`") but was never actually committed in
+this nested repo -- caught while preparing an unrelated commit and backfilled here rather than
+left uncommitted or silently folded into other work.
+
+Item 24 above claimed no `transfer_eval.py` change was needed since "zero-shot eval has no
+training-time stochasticity." That's true for pure zero-shot (`--finetune_epochs 0`, the default),
+but incomplete: `transfer_eval.py` also supports fine-tuning the checkpoint on the target domain's
+train split before a second eval pass (`--finetune_epochs`/`--early_stopping`), and that phase has
+its own real stochasticity (train-loader shuffling order) uncontrolled by a pretrain-time seed.
+Same pattern as item 24: `--seed` arg (default `None`), `run()` calls `random.seed`/
+`np.random.seed`/`torch.manual_seed` at the top, before the fine-tune phase. Threaded through
+`fedlgr_officedb/transfer_office_to_home.py`'s existing `--seed` (already committed there,
+depended on this vendor-side code already existing).
+
 ## 25. `main_fcl.py`, `client/default.py`, `client/fedRoot.py`, `utils.py` -- chained-job resume for FCL Axis A
 
 **Status: implemented, validated, and merged into `officedb-adapt`** 2026-08-05 (developed on a
