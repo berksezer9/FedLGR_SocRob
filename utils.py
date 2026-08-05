@@ -1,4 +1,6 @@
 from collections import OrderedDict
+import os
+import pickle
 from typing import Dict, List, Optional, Tuple
 
 import copy
@@ -172,7 +174,7 @@ def train(model, train_loader, epochs, DEVICE):
 
 def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels, max_epochs=40, patience=5):
 	# Val-loss-based early stopping + best-checkpoint selection
-	# (OFFICEDB_MODIFICATIONS.md item 23), added because the domain-transfer
+	# (OFFICEDB_MODIFICATIONS.md item 25), added because the domain-transfer
 	# experiment's original fixed --epochs count had no way to tell
 	# "converged" apart from "still improving" or "already overfitting" --
 	# per-epoch training-loss logs showed Office-domain checkpoints
@@ -399,7 +401,37 @@ def get_eval_fn(net, testloader, y_labels, DEVICE):
 	return evaluate
 
 
-def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks=2, active_idx_per_task=None):
+def _dump_global_params(reference_module, path):
+	# Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): pickles a plain
+	# state_dict, same convention as pretrain.py's pickle.dump(model.state_dict(), f).
+	# Written atomically (tmp file + os.replace) so a job killed mid-write
+	# (e.g. hitting the Slurm wall-time cap) can't leave a half-written,
+	# unloadable checkpoint for the next chained job to trip over.
+	tmp = f"{path}.tmp"
+	with open(tmp, 'wb') as f:
+		pickle.dump(reference_module.state_dict(), f)
+	os.replace(tmp, path)
+
+
+def make_checkpoint_hook(reference_module, checkpoint_path):
+	# Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): the FedRoot
+	# strategy branches in main_fcl.py construct FedAvgWithAccuracyMetric with
+	# no evaluate_fn at all (no centralized eval today), so there's no
+	# existing per-round hook there to hang a checkpoint dump off of. This is
+	# a checkpoint-only stand-in -- always returns None, which flwr 1.12.0's
+	# Strategy.evaluate() treats as "no centralized eval this round" (see
+	# flwr/server/strategy/fedavg.py), leaving history.losses_centralized
+	# untouched exactly as today's no-evaluate_fn behavior.
+	def evaluate(server_round, weights, config):
+		params_dict = zip(reference_module.state_dict().keys(), weights)
+		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+		reference_module.load_state_dict(state_dict, strict=True)
+		_dump_global_params(reference_module, checkpoint_path)
+		return None
+	return evaluate
+
+
+def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks=2, active_idx_per_task=None, round_offset=0, checkpoint_path=None):
 	# testloader is the cumulative per-task-boundary test loader list from
 	# dataloader.utils.task_splitter (tasks 0..task_idx combined) -- see
 	# OFFICEDB_MODIFICATIONS.md. Originally hardcoded to "<=5"/testloader[0]
@@ -418,7 +450,10 @@ def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks
 		params_dict = zip(net.state_dict().keys(), weights)
 		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
 		net.load_state_dict(state_dict, strict=True)
-		task_idx = min((server_round - 1) // rounds_per_task, n_tasks - 1)
+		if checkpoint_path is not None:
+			_dump_global_params(net, checkpoint_path)
+		effective_round = server_round + round_offset  # OFFICEDB_MODIFICATIONS.md item 25
+		task_idx = min((effective_round - 1) // rounds_per_task, n_tasks - 1)
 		if active_idx_per_task is not None:
 			active_idx = active_idx_per_task[task_idx]
 			task_y_labels = [y_labels[i] for i in active_idx]

@@ -707,6 +707,145 @@ that call's own randomness uncontrolled. Threaded through
 `transfer_eval.py`: zero-shot eval has no training-time stochasticity and aggregate PCC/RMSE are
 order-invariant, so the eval half of the pipeline needed no change.
 
+## 25. `main_fcl.py`, `client/default.py`, `client/fedRoot.py`, `utils.py` -- chained-job resume for FCL Axis A
+
+**Status: implemented, validated, and merged into `officedb-adapt`** 2026-08-05 (developed on a
+separate `fcl-resume` branch/worktree while `officedb-adapt` was shared live by
+jobs/worktrees mid-run; merged once both the synthetic gate and the real-data chained-sbatch gate
+below had passed).
+
+**Why**: a real FCL Axis A combo (15 rounds = 3 tasks x 5 rounds/task, real `epochs=10`) is
+projected at ~20-24h on CPU (extrapolated from the FL sweep's confirmed ~78-91 min/round at the
+same n=3/24-CPU config) -- longer than CSD3's 12h QOS wall cap on every account tried
+(`gunes-sl3-cpu`, `gunes-sl3-gpu`/`sl4-gpu`). This lets one combo span multiple 12h-capped Slurm
+jobs, one per task, resuming both the client-side CL state (already round-tripped through pickle
+files per round, see item 6) and the Flower-aggregated global model weights (previously never
+persisted).
+
+**Two real, pre-existing bugs found and fixed while building this** (not introduced by this
+adaptation, surfaced because chaining depends on them):
+1. `main_fcl.py`'s experiment directory was unconditionally derived from `datetime.now()` on
+   every invocation -- a second chained job would silently write into a brand-new empty
+   directory, never find the first job's `task{cid}.txt`/`reg{cid}.pkl`, and quietly restart CL
+   bookkeeping at task 0 (wrong answer, not a crash). Fixed via new `--experiment_dir` (below).
+2. The 3 FedRoot strategy-construction branches (EWC-family, NR, LGR) build
+   `FedAvgWithAccuracyMetric` with no `evaluate_fn` at all -- the only existing driver-side hook
+   that sees full global weights (`get_eval_fn_cl`, used by the 2 FedAvg-family branches) doesn't
+   cover FedRoot. A second, checkpoint-only hook (`make_checkpoint_hook`, `utils.py`) fills this
+   gap -- always returns `None`, confirmed safe against flwr 1.12.0's `Strategy.evaluate()`
+   (treats `None` as "no centralized eval this round", `history.losses_centralized` stays
+   untouched exactly as today's no-`evaluate_fn` behavior).
+
+**New opt-in parameters, all defaulting to reproduce original behavior exactly**:
+- `--round_offset` (int, default 0): added to `FlowerClientCL`/`FlowerClient_NR`
+  (`client/default.py`) and `FlowerClientCL_Root`/`FlowerClient_NR_Root`/`FlowerClient_LGR`
+  (`client/fedRoot.py`). `effective_round = server_round + round_offset` replaces raw
+  `server_round` everywhere `_task_idx`/`_is_boundary` (and the NR/NR_Root classes'
+  `server_round == int(self.nrounds)` final-round replay-buffer-deletion check) use it. Since
+  chunks are required to align exactly to task boundaries, `round_offset = (job_index-1) *
+  rounds_per_task` is an exact substitution -- Flower's own `server_round` always restarts at 1
+  for a fresh `start_simulation()` call, which this offsets back to the correct global round.
+- `--rounds_this_run` (int, default `None` -> falls back to `--rounds`): decouples "Flower
+  rounds this process executes" from `rounds` (still used for CSV filenames and
+  `rounds_per_task = rounds // n_tasks` math, exactly as before). `main_fcl.py`'s `run_strategy()`
+  gates its whole chunked-vs-monolithic code path on `chunked = rounds_this_run != rounds` --
+  when `False`, the original CSV-writing/`plot_results` code runs byte-for-byte unchanged.
+- `--experiment_dir` (str, default `None`): see bug #1 above.
+- `--seed` (int, default `None`): `main_fcl.py` previously seeded nothing at all (unlike
+  `main.py`'s always-on `torch.manual_seed(1024)`); only used so far for resume-equivalence
+  testing, not required by the resume mechanism itself.
+
+**Checkpoint mechanism** (`utils.py`): `_dump_global_params(reference_module, path)` pickles a
+plain `state_dict()` atomically (tmp file + `os.replace`, so a job killed mid-write -- e.g. by
+the Slurm wall-time cap -- can't leave a half-written, unloadable checkpoint for the next
+chained job), same convention as `pretrain.py`'s existing `pickle.dump(model.state_dict(), f)`.
+Wired into `get_eval_fn_cl`'s `evaluate()` closure (2 FedAvg-family branches) and the new
+`make_checkpoint_hook` (3 FedRoot branches, bug #2 above) -- dumped every round (not just the
+last), cheap and self-healing if a job dies mid-chunk. Loaded back via a new
+`_load_checkpoint_params(checkpoint_path, fallback)` helper in `main_fcl.py`, called at all 5
+strategy-construction sites right before `initial_parameters=fl.common.ndarrays_to_parameters(...)`
+is built -- returns `fallback` (the fresh net's own `get_parameters()` output, unchanged)
+whenever `checkpoint_path` is `None` or doesn't exist yet, and deliberately returns a *new* list
+rather than mutating the shared `params` variable in place, so an earlier branch's checkpoint
+pickup in a `--strategy_cl all`/`--reg_coef all` sweep can never leak into a later branch that
+has no checkpoint of its own. Both dump and load are gated on `--experiment_dir` being set
+(independent of `chunked`), so they're also usable standalone as a diagnostic on a monolithic run.
+
+**`run_strategy()` result-accumulation rework**: `rounds` was previously used for three things
+at once inside `run_strategy()` -- Flower's actual `num_rounds`, the CSV filename, and which
+`history` indices count as "task-final" (assumes one `history` object spans all `n_tasks`).
+A chunked job's own `history` only has as many entries as rounds *it* ran, so reusing the
+original indexing as-is would `IndexError`. When `chunked`, instead of writing the final CSV row
+immediately, this job's task-final metrics get merged into a small per-combo JSON state file
+(`{output}/.chunked_state/<strategy>_<coeff>_<clients>_<rounds>_<epochs>_<aug>.json`, atomic
+write) keyed by task number; only once every task is present does the same-shaped decentral/
+central CSV row get assembled and appended, reading from the merged state instead of one
+`history` object.
+
+**Explicit scope cuts, not implemented in this pass**:
+- Full 15-round `plot_results()` reconstruction across chunks -- each chunk still emits its own
+  local (single-task) plot. Only CSV metric parity is required/tested.
+- `savecomp()`'s `comp.csv` gets `n_tasks` diagnostic RAM/CPU/GPU rows per chunked combo instead
+  of 1 -- cosmetic only, not a scored metric.
+- SI's online importance accumulator (`self.w` in `CL/default.py`) and NR's single-slot (not
+  full-history) `reg{cid}.pkl` are both pre-existing vendor characteristics, identical whether a
+  combo runs monolithically or chunked -- not touched by this item.
+
+**Verification: synthetic gate run 2026-08-03** (`fedlgr_officedb/slurm/_resume_equivalence_test.sh`
++ `_resume_equivalence_check.py`, via `srun` on `gunes-sl3-cpu`/icelake, synthetic
+`smoke_test/data/office_fl`): monolithic run vs. a 3-job chunked run of the same tiny combo,
+for both `FedAvg`x`EWC` (exercises `get_eval_fn_cl`'s checkpoint dump) and `FedRoot`x`NR`
+(exercises `make_checkpoint_hook` and the NR-Root `effective_round==nrounds` fix). Two swaps
+from the original plan, both logged in the test script: (1) the scratch dir must be
+Lustre-backed (`results/fedlgr_officedb/_resume_equivalence_scratch/`), not node-local `/tmp` --
+`srun` runs on a compute node, so a login-node-relative `/tmp` path is invisible both during and
+after the job; (2) `FedRoot`x`LGR` was swapped for `FedRoot`x`NR` -- LGR's replay generator
+(`CL/default.py`, `DataLoader(combined_dataset, batch_size=16, shuffle=True)`, no
+`drop_last=True`) crashes on a remainder-of-1 batch at the 2nd task boundary, confirmed via a
+real run to happen in the **monolithic** path too (i.e. a genuine pre-existing vendor bug, not
+caused by chunking) -- flagged, not fixed, same treatment as the SI/NR quirks above; `NR` shares
+`make_checkpoint_hook` identically so covers the FedRoot-family checkpoint path just as well.
+
+**All structural/mechanism checks passed**: `task{cid}.txt`/`reg{cid}.pkl`/`mod{cid}.pkl` match
+exactly between mono and chunked; `global_params.pkl` loads cleanly as a non-empty state_dict for
+every chunk; CSV row shape matches. **Checkpoint continuity confirmed bit-exact** by
+cross-referencing the raw Flower log directly (not automated into the checker): job 2's very
+first `evaluate_fn` call ("initial parameters (loss, ...)", using job 1's checkpoint, before job
+2 does any of its own training) reported loss `52.745880126953125`, which equals job 1's own
+final reported `Loss1` in the chunked CSV to full float precision; likewise job 3's initial loss
+(`478.75341796875`) equals job 2's final `Loss2` exactly. This is direct proof the checkpoint
+round-trips the exact correct state across separate OS processes, not an approximation.
+
+**Final CSV metric values (mono vs. chunked) do NOT match, and this is expected, not a gate
+failure**: a chunked job N+1 is a fresh process that calls `torch.manual_seed(args.seed)` once
+at the top, immediately before its own first round -- its RNG stream (and DataLoader shuffle
+order, which has no seeded `generator=`) starts fresh at "task N+1, round 1" every time. The
+monolithic run's RNG stream, by contrast, has already been advanced by every prior task's
+training when it reaches the same task. Same seed, same checkpointed weights (proven bit-exact
+above), but different actual gradient steps taken from task 2 onward -- and this tiny/
+undertrained synthetic setup is volatile enough (loss in the hundreds-to-thousands range on
+2-sample batches) that the resulting trajectories diverge substantially. This is a property of
+the tiny synthetic test data's instability, not the resume mechanism; `_resume_equivalence_check.py`
+prints these as `[INFO]`, not `[FAIL]`, with the full reasoning in its `compare_csv()` docstring.
+
+**Real-data chained-sbatch gate: passed** (`fedlgr_officedb/slurm/submit_fcl_chain.py`, genuine
+`--dependency=afterok` jobs across separate compute-node allocations, real OfficeDB Axis A data,
+2026-08-04/05). Of 6 combos x 3 chunks submitted (`FedAvg`x`EWC` at 3 `reg_coef` values,
+`FedAvg`x`NR`/100, `FedRoot`x`EWC`/0.001, `FedRoot`x`NR`/100 -- 18 jobs), 17 completed cleanly on
+the first attempt. The one exception, `FedRoot`x`NR`/100 chunk2 (job 32832506), is not a resume
+bug: all 3 clients were still legitimately mid-`epoch 9/10` when Flower's `round_timeout` fired --
+round 6 (chunk2's first round, i.e. task 2's first round, where NR's rehearsal buffer starts
+being replayed alongside the new task's data) took ~125min, just over the then-`FL_ROUND_TIMEOUT`
+of 7200s/120min. Plain `FedAvg`x`NR` and plain `FedRoot`x`EWC` both stayed comfortably under
+120min/round in the same batch, so it's specifically the FedRoot-root-model-compute +
+NR-replay-cost combination that's this slow, worst at task-boundary rounds. Fixed by raising
+`fcl_axis_a_chunk.sbatch`'s default `FL_ROUND_TIMEOUT` to 10800s (180min) -- pure headroom, since
+the timeout is a ceiling and doesn't slow down combos that finish faster; matters most for the
+full-sweep's other `FedRoot`x`NR` buffer sizes (10/1000) still queued, since larger buffers
+replay more samples per epoch and would only make this worse. Retried as jobs
+32894066/32894067 (chunk2/chunk3, resumed from chunk1's checkpoint via `--experiment_dir`, same
+mechanism as any other chained resume).
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

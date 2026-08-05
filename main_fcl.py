@@ -18,10 +18,15 @@ from CL.default import EWCOnline, SI, MAS, LatentGenerativeReplay
 from CL.default import Naive_Rehearsal as NR
 from datetime import datetime
 from metrics.computation import RAMU, CPUUsage, GPUUsage
-from utils import plot_results, get_eval_fn_cl, extract_metrics_gpu_csv, truncate_float
+from utils import plot_results, get_eval_fn_cl, extract_metrics_gpu_csv, truncate_float, make_checkpoint_hook
 import gc
 import pickle
 import warnings
+# Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25):
+import random
+import numpy as np
+import json
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
@@ -32,17 +37,38 @@ warnings.filterwarnings("ignore")
 ROUND_TIMEOUT = float(os.environ["FL_ROUND_TIMEOUT"]) if os.environ.get("FL_ROUND_TIMEOUT") else None
 
 
+def _load_checkpoint_params(checkpoint_path, fallback):
+    # Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): overrides a
+    # combo's initial Flower parameters from a previous chained job's final
+    # checkpoint, if present. `fallback` (the fresh net's own get_parameters()
+    # output, computed once per n_cl loop iteration exactly as before) is
+    # returned unchanged when checkpoint_path is None or doesn't exist yet --
+    # default/first-job behavior exactly as before. Deliberately returns a
+    # NEW list rather than mutating `fallback`/`params` in place, so an
+    # earlier branch's checkpoint pickup in a --strategy_cl all/--reg_coef all
+    # sweep can never leak into a later branch that has no checkpoint of its
+    # own yet.
+    if checkpoint_path is None or not os.path.exists(checkpoint_path):
+        return fallback
+    with open(checkpoint_path, 'rb') as f:
+        state_dict = pickle.load(f)
+    return [v.cpu().numpy() for v in state_dict.values()]
+
+
 def run_strategy(strategy, strategy_name, coeff, client_fn, clients, rounds, epochs, output, aug, ray_init_args,
-                 client_res, n_tasks=2):
+                 client_res, n_tasks=2, rounds_this_run=None, round_offset=0):
     # Generalizes vendor's original hardcoded 2-task Loss1/RMSE1/PCC1/Loss2/RMSE2/PCC2
     # columns to N task-boundary columns (see OFFICEDB_MODIFICATIONS.md). For
     # n_tasks=2 this produces the identical column set/values as before.
     print("Running strategy " + str(strategy_name) + " for " + str(clients) + "clients!")
 
+    # Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): rounds_this_run
+    # defaults to rounds (today's one-shot behavior exactly) when not given.
+    actual_rounds = int(rounds_this_run) if rounds_this_run is not None else int(rounds)
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=int(clients),
-        config=fl.server.ServerConfig(num_rounds=int(rounds), round_timeout=ROUND_TIMEOUT),  # Just three rounds
+        config=fl.server.ServerConfig(num_rounds=actual_rounds, round_timeout=ROUND_TIMEOUT),  # Just three rounds
         strategy=strategy,
         ray_init_args=ray_init_args,
         client_resources=client_res,
@@ -54,52 +80,122 @@ def run_strategy(strategy, strategy_name, coeff, client_fn, clients, rounds, epo
     for t in range(1, n_tasks + 1):
         metric_cols += [f"Loss{t}", f"RMSE{t}", f"PCC{t}"]
 
-    try:
-        data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
-        data.drop(["Unnamed: 0"], axis=1, inplace=True)
-    except:
-        data = pd.DataFrame(columns=["Method", "reg_coeff"] + metric_cols)
+    chunked = actual_rounds != int(rounds)
 
-    row = [f"{strategy_name}", f"{coeff}"]
-    for r in task_rounds:
-        # losses_distributed/metrics_distributed are 0-indexed per completed round (round 1 -> index 0)
-        idx = r - 1
-        row += [truncate_float(history.losses_distributed[idx][-1], 4),
-                truncate_float(history.metrics_distributed['avg_rmse'][idx][-1], 4),
-                truncate_float(history.metrics_distributed['avg_pearson_score'][idx][-1], 4)]
-    data = pd.concat([data, pd.Series(row, index=data.columns).to_frame().T])
-
-    data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
-
-    try:
+    if not chunked:
+        # ---- Original, byte-for-byte unchanged code path. ----
         try:
-            data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
+            data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
             data.drop(["Unnamed: 0"], axis=1, inplace=True)
         except:
             data = pd.DataFrame(columns=["Method", "reg_coeff"] + metric_cols)
 
         row = [f"{strategy_name}", f"{coeff}"]
         for r in task_rounds:
-            # losses_centralized/metrics_centralized include an initial round-0
-            # evaluation (before training) at index 0, so round r sits at index r.
-            row += [truncate_float(history.losses_centralized[r][-1], 4),
-                    truncate_float(history.metrics_centralized['avg_rmse'][r][-1], 4),
-                    truncate_float(history.metrics_centralized['avg_pearson_score'][r][-1], 4)]
+            # losses_distributed/metrics_distributed are 0-indexed per completed round (round 1 -> index 0)
+            idx = r - 1
+            row += [truncate_float(history.losses_distributed[idx][-1], 4),
+                    truncate_float(history.metrics_distributed['avg_rmse'][idx][-1], 4),
+                    truncate_float(history.metrics_distributed['avg_pearson_score'][idx][-1], 4)]
         data = pd.concat([data, pd.Series(row, index=data.columns).to_frame().T])
-        data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
 
-    except:
-        print("Centralised results not available")
-    if '-' in strategy_name:
-        strategy_name, base_name = strategy_name.split('-')
-        if 'LGR' in base_name:
-            save_path = f"{output}/{strategy_name}/{strategy_name}-{base_name}_{aug}_{clients}_{rounds}_{epochs}"
+        data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
+
+        try:
+            try:
+                data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
+                data.drop(["Unnamed: 0"], axis=1, inplace=True)
+            except:
+                data = pd.DataFrame(columns=["Method", "reg_coeff"] + metric_cols)
+
+            row = [f"{strategy_name}", f"{coeff}"]
+            for r in task_rounds:
+                # losses_centralized/metrics_centralized include an initial round-0
+                # evaluation (before training) at index 0, so round r sits at index r.
+                row += [truncate_float(history.losses_centralized[r][-1], 4),
+                        truncate_float(history.metrics_centralized['avg_rmse'][r][-1], 4),
+                        truncate_float(history.metrics_centralized['avg_pearson_score'][r][-1], 4)]
+            data = pd.concat([data, pd.Series(row, index=data.columns).to_frame().T])
+            data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
+
+        except:
+            print("Centralised results not available")
+        if '-' in strategy_name:
+            strategy_name, base_name = strategy_name.split('-')
+            if 'LGR' in base_name:
+                save_path = f"{output}/{strategy_name}/{strategy_name}-{base_name}_{aug}_{clients}_{rounds}_{epochs}"
+            else:
+                save_path = f"{output}/{coeff}/{strategy_name}-{base_name}_{aug}_{clients}_{rounds}_{epochs}"
         else:
-            save_path = f"{output}/{coeff}/{strategy_name}-{base_name}_{aug}_{clients}_{rounds}_{epochs}"
-    else:
-        save_path = f"{output}/{coeff}/{strategy_name}_{aug}_{clients}_{rounds}_{epochs}"
+            save_path = f"{output}/{coeff}/{strategy_name}_{aug}_{clients}_{rounds}_{epochs}"
 
-    plot_results(history=history, save_path=save_path)
+        plot_results(history=history, save_path=save_path)
+    else:
+        # ---- Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): this job only
+        # ran `actual_rounds` of the nominal `rounds` total, covering exactly one
+        # task (chunks are required to align to task boundaries). Merge this job's
+        # task-final metrics into a per-combo state file instead of writing the
+        # summary CSV row immediately; only the job that completes the LAST task
+        # actually appends the row, reading from the merged state. ----
+        assert (round_offset + actual_rounds) % rounds_per_task == 0, \
+            "chunked runs must align exactly to task boundaries"
+        task_num = (round_offset + actual_rounds) // rounds_per_task  # 1-based task this job just completed
+
+        state_dir = Path(output) / ".chunked_state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_path = state_dir / f"{strategy_name}_{coeff}_{clients}_{rounds}_{epochs}_{aug}.json"
+        state = json.loads(state_path.read_text()) if state_path.exists() else \
+            {"completed_tasks": [], "decentral": {}, "central": {}}
+
+        local_decentral_idx = actual_rounds - 1  # 0-indexed, this job's own local history
+        local_central_idx = actual_rounds  # +1 for the round-0 eval, same convention as the monolithic path
+        state["decentral"][str(task_num)] = [
+            truncate_float(history.losses_distributed[local_decentral_idx][-1], 4),
+            truncate_float(history.metrics_distributed['avg_rmse'][local_decentral_idx][-1], 4),
+            truncate_float(history.metrics_distributed['avg_pearson_score'][local_decentral_idx][-1], 4),
+        ]
+        try:
+            state["central"][str(task_num)] = [
+                truncate_float(history.losses_centralized[local_central_idx][-1], 4),
+                truncate_float(history.metrics_centralized['avg_rmse'][local_central_idx][-1], 4),
+                truncate_float(history.metrics_centralized['avg_pearson_score'][local_central_idx][-1], 4),
+            ]
+        except Exception:
+            state["central"][str(task_num)] = None  # mirrors "Centralised results not available"
+
+        if task_num not in state["completed_tasks"]:
+            state["completed_tasks"].append(task_num)
+        tmp_state_path = state_path.with_suffix(".json.tmp")
+        tmp_state_path.write_text(json.dumps(state))
+        tmp_state_path.replace(state_path)  # atomic
+
+        if len(state["completed_tasks"]) == n_tasks:
+            try:
+                data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
+                data.drop(["Unnamed: 0"], axis=1, inplace=True)
+            except Exception:
+                data = pd.DataFrame(columns=["Method", "reg_coeff"] + metric_cols)
+            row = [f"{strategy_name}", f"{coeff}"]
+            for t in range(1, n_tasks + 1):
+                row += state["decentral"][str(t)]
+            data = pd.concat([data, pd.Series(row, index=data.columns).to_frame().T])
+            data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_decentral.csv")
+
+            if all(state["central"].get(str(t)) is not None for t in range(1, n_tasks + 1)):
+                try:
+                    data = pd.read_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
+                    data.drop(["Unnamed: 0"], axis=1, inplace=True)
+                except Exception:
+                    data = pd.DataFrame(columns=["Method", "reg_coeff"] + metric_cols)
+                row = [f"{strategy_name}", f"{coeff}"]
+                for t in range(1, n_tasks + 1):
+                    row += state["central"][str(t)]
+                data = pd.concat([data, pd.Series(row, index=data.columns).to_frame().T])
+                data.to_csv(f"{output}/{clients}_{rounds}_{epochs}_{aug}_central.csv")
+            # plot_results() intentionally not reconstructed across chunks here --
+            # each chunk still emits its own local (per-task) plot. See
+            # OFFICEDB_MODIFICATIONS.md item 25 for the documented scope cut.
+
     del history
     ray.shutdown()
 
@@ -122,7 +218,7 @@ def run(args):
                               y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                               path=f"{output_reg}",
                               DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
-                              active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
+                              active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task, round_offset=args.round_offset)
 
     def client_fn_NR(cid) -> FlowerClient_NR:
         return FlowerClient_NR(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
@@ -130,7 +226,7 @@ def run(args):
                                y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                path=f"{output_NR}",
                                DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
-                               active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
+                               active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task, round_offset=args.round_offset)
 
     def client_fn_reg_root(cid) -> FlowerClientCL_Root:
         return FlowerClientCL_Root(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
@@ -138,7 +234,7 @@ def run(args):
                                    y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                    path=f"{output_root_reg}",
                                    DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
-                                   active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
+                                   active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task, round_offset=args.round_offset)
 
     def client_fn_NR_root(cid) -> FlowerClient_NR_Root:
         return FlowerClient_NR_Root(cid, net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
@@ -146,7 +242,7 @@ def run(args):
                                     y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                     path=f"{output_root_NR}",
                                     DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
-                                    active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
+                                    active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task, round_offset=args.round_offset)
 
     def client_fn_LGR(cid) -> FlowerClient_LGR:
         return FlowerClient_LGR(cid, net=net.to(DEVICE), trainloader=trainloaders, valloader=valloaders,
@@ -154,12 +250,21 @@ def run(args):
                                 y_labels=y_labels, cl_strategy=caller, agent_config=agent_config, nrounds=int(args.rounds),
                                 path=f"{output}",
                                 DEVICE=DEVICE, num_clients=n_cl, strat_name=strat_cl, params=params, n_tasks=args.n_tasks,
-                                active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task)
+                                active_idx_per_task=active_idx_per_task, cumulative_idx_per_task=cumulative_idx_per_task, round_offset=args.round_offset)
 
     if args.model == 'MobileNet':
         from models.MobileNet import Net
     elif args.model == 'DeepLabMobileNet':
         from models.deepLabMobileNet import Net
+
+    # Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): main_fcl.py
+    # previously seeded nothing at all (unlike main.py's always-on
+    # torch.manual_seed(1024)); None (default) reproduces that unseeded
+    # behavior exactly. Only used so far for resume-equivalence testing.
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
 
     # None (default) reproduces vendor's original MANNERS-DB column names/2-task
     # circle-arrow split; comma-separated CLI values override them for OfficeDB's
@@ -197,7 +302,16 @@ def run(args):
         cumulative_idx_per_task = None
 
     # make a directory in the output folder with name "YYMMDD_HHMMSS" followed by the arguments
-    experiment_path = f"{args.output}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.strategy_fl}_{args.strategy_cl}_{args.model}_{args.rounds}_{args.icl}_{args.fcl}_{args.aug}_{args.processor_type}"
+    # Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): a fresh
+    # datetime.now()-derived directory every invocation meant a chained job
+    # could never find a previous job's task{cid}.txt/reg{cid}.pkl/checkpoint
+    # -- silently restarting CL bookkeeping at task 0 instead of erroring.
+    # --experiment_dir, when given, is used verbatim instead. None (default)
+    # reproduces the original per-invocation timestamped directory exactly.
+    if args.experiment_dir:
+        experiment_path = args.experiment_dir
+    else:
+        experiment_path = f"{args.output}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.strategy_fl}_{args.strategy_cl}_{args.model}_{args.rounds}_{args.icl}_{args.fcl}_{args.aug}_{args.processor_type}"
     if not os.path.exists(experiment_path):
         os.makedirs(experiment_path)
     # update the output path
@@ -312,14 +426,19 @@ def run(args):
                                 caller = MAS
                             client_fn = client_fn_reg
 
+                            # Chained-job resume (OFFICEDB_MODIFICATIONS.md item 25): _ckpt_path is
+                            # None unless --experiment_dir is set, reproducing original behavior exactly.
+                            _ckpt_path = f"{output_reg}/global_params.pkl" if args.experiment_dir else None
+                            _initial_params = _load_checkpoint_params(_ckpt_path, params)
                             strategy = FedAvgWithAccuracyMetric(
                                 min_available_clients=int(n_cl),
-                                initial_parameters=fl.common.ndarrays_to_parameters(params),
+                                initial_parameters=fl.common.ndarrays_to_parameters(_initial_params),
                                 on_fit_config_fn=fit_config,
                                 on_evaluate_config_fn=evaluate_config,
                                 evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels,
                                                             rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks,
-                                                            active_idx_per_task=cumulative_idx_per_task)
+                                                            active_idx_per_task=cumulative_idx_per_task,
+                                                            round_offset=args.round_offset, checkpoint_path=_ckpt_path)
                             )
                             
                             rambef = ramu.compute("BEFORE EVALUATION")
@@ -332,7 +451,8 @@ def run(args):
                             run_strategy(strategy=strategy, strategy_name=f"{strat_cl}", coeff=coeff,
                                          client_fn=client_fn, clients=n_cl, rounds=int(args.rounds),
                                          epochs=int(args.epochs), output=f"{output}", aug=args.aug,
-                                         ray_init_args=ray_init_args, client_res=client_res, n_tasks=args.n_tasks)
+                                         ray_init_args=ray_init_args, client_res=client_res, n_tasks=args.n_tasks,
+                                         rounds_this_run=args.rounds_this_run, round_offset=args.round_offset)
                             
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
@@ -362,14 +482,17 @@ def run(args):
                             caller = NR
                             client_fn = client_fn_NR
 
+                            _ckpt_path = f"{output_NR}/global_params.pkl" if args.experiment_dir else None
+                            _initial_params = _load_checkpoint_params(_ckpt_path, params)
                             strategy = FedAvgWithAccuracyMetric(
                                 min_available_clients=int(n_cl),
-                                initial_parameters=fl.common.ndarrays_to_parameters(params),
+                                initial_parameters=fl.common.ndarrays_to_parameters(_initial_params),
                                 on_fit_config_fn=fit_config,
                                 on_evaluate_config_fn=evaluate_config,
                                 evaluate_fn=get_eval_fn_cl(net, testloader=valloaders, DEVICE=DEVICE, y_labels=y_labels,
                                                             rounds_per_task=int(args.rounds) // args.n_tasks, n_tasks=args.n_tasks,
-                                                            active_idx_per_task=cumulative_idx_per_task)
+                                                            active_idx_per_task=cumulative_idx_per_task,
+                                                            round_offset=args.round_offset, checkpoint_path=_ckpt_path)
 
                             )
                             rambef = ramu.compute("BEFORE EVALUATION")
@@ -380,7 +503,8 @@ def run(args):
                                 gpubeff = 0
                             run_strategy(strategy, f"{strat_cl}", buffer_size, client_fn, n_cl, int(args.rounds),
                                          int(args.epochs),
-                                         f"{output}", args.aug, ray_init_args, client_res, args.n_tasks)
+                                         f"{output}", args.aug, ray_init_args, client_res, args.n_tasks,
+                                         rounds_this_run=args.rounds_this_run, round_offset=args.round_offset)
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
                             if gpu_flag == 1:
@@ -421,11 +545,14 @@ def run(args):
                             elif strat_cl == 'MAS':
                                 caller = MAS
                             client_fn = client_fn_reg_root
+                            _ckpt_path = f"{output_root_reg}/global_params.pkl" if args.experiment_dir else None
+                            _initial_params = _load_checkpoint_params(_ckpt_path, params)
                             strategy = FedAvgWithAccuracyMetric(
                                 min_available_clients=int(n_cl),
-                                initial_parameters=fl.common.ndarrays_to_parameters(params),
+                                initial_parameters=fl.common.ndarrays_to_parameters(_initial_params),
                                 on_fit_config_fn=fit_config,
-                                on_evaluate_config_fn=evaluate_config
+                                on_evaluate_config_fn=evaluate_config,
+                                evaluate_fn=(make_checkpoint_hook(net.conv_module, _ckpt_path) if args.experiment_dir else None)
                             )
                             rambef = ramu.compute("BEFORE EVALUATION")
                             cpubef = cpuu.compute("BEFORE EVALUATION")
@@ -436,7 +563,8 @@ def run(args):
                             run_strategy(strategy=strategy, strategy_name=f"{strat_cl}", coeff=coeff,
                                          client_fn=client_fn, clients=n_cl, rounds=int(args.rounds),
                                          epochs=int(args.epochs), output=f"{output}", aug=args.aug,
-                                         ray_init_args=ray_init_args, client_res=client_res, n_tasks=args.n_tasks)
+                                         ray_init_args=ray_init_args, client_res=client_res, n_tasks=args.n_tasks,
+                                         rounds_this_run=args.rounds_this_run, round_offset=args.round_offset)
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
                             if gpu_flag == 1:
@@ -463,11 +591,14 @@ def run(args):
 
                             client_fn = client_fn_NR_root
 
+                            _ckpt_path = f"{output_root_NR}/global_params.pkl" if args.experiment_dir else None
+                            _initial_params = _load_checkpoint_params(_ckpt_path, params)
                             strategy = FedAvgWithAccuracyMetric(
                                 min_available_clients=int(n_cl),
-                                initial_parameters=fl.common.ndarrays_to_parameters(params),
+                                initial_parameters=fl.common.ndarrays_to_parameters(_initial_params),
                                 on_fit_config_fn=fit_config,
-                                on_evaluate_config_fn=evaluate_config
+                                on_evaluate_config_fn=evaluate_config,
+                                evaluate_fn=(make_checkpoint_hook(net.conv_module, _ckpt_path) if args.experiment_dir else None)
 
                             )
                             rambef = ramu.compute("BEFORE EVALUATION")
@@ -478,7 +609,8 @@ def run(args):
                                 gpubeff = 0
                             run_strategy(strategy, f"{strat_cl}", buffer_size, client_fn, n_cl, int(args.rounds),
                                          int(args.epochs),
-                                         f"{output}", args.aug, ray_init_args, client_res, args.n_tasks)
+                                         f"{output}", args.aug, ray_init_args, client_res, args.n_tasks,
+                                         rounds_this_run=args.rounds_this_run, round_offset=args.round_offset)
                             ramaf = ramu.compute("AFTER EVALUATION")
                             cpuaf = cpuu.compute("AFTER EVALUATION")
                             if gpu_flag == 1:
@@ -529,11 +661,14 @@ def run(args):
 
                         gr = VAE(input_dim, latent_dim, encoder_units, decoder_units)
                         client_fn = client_fn_LGR
+                        _ckpt_path = f"{output_root_LGR}/global_params.pkl" if args.experiment_dir else None
+                        _initial_params = _load_checkpoint_params(_ckpt_path, params)
                         strategy = FedAvgWithAccuracyMetric(
                             min_available_clients=int(n_cl),
-                            initial_parameters=fl.common.ndarrays_to_parameters(params),
+                            initial_parameters=fl.common.ndarrays_to_parameters(_initial_params),
                             on_fit_config_fn=fit_config,
-                            on_evaluate_config_fn=evaluate_config
+                            on_evaluate_config_fn=evaluate_config,
+                            evaluate_fn=(make_checkpoint_hook(net.conv_module, _ckpt_path) if args.experiment_dir else None)
 
                         )
                         rambef = ramu.compute("BEFORE EVALUATION")
@@ -544,7 +679,8 @@ def run(args):
                             gpubeff = 0
                         run_strategy(strategy, f"{strat_cl}", 'LGR', client_fn, n_cl, int(args.rounds),
                                      int(args.epochs),
-                                     f"{output}", args.aug, ray_init_args, client_res, args.n_tasks)
+                                     f"{output}", args.aug, ray_init_args, client_res, args.n_tasks,
+                                     rounds_this_run=args.rounds_this_run, round_offset=args.round_offset)
                         ramaf = ramu.compute("AFTER EVALUATION")
                         cpuaf = cpuu.compute("AFTER EVALUATION")
                         if gpu_flag == 1:
@@ -593,6 +729,21 @@ if __name__ == "__main__":
                               "action names within a task separated by '|' (names must be a subset of --action_cols). "
                               "E.g. 'A|B|C;D|E|F;G|H|I' for 3 tasks of 3 actions each.")
     parser.add_argument("--num_cpus", type=int, default=4, help="Total CPUs given to Ray's pool (set to the VM's vCPU count to enable concurrent clients; see OFFICEDB_MODIFICATIONS.md)")
+    parser.add_argument("--round_offset", type=int, default=0,
+                         help="Added to Flower's server_round before task_idx/boundary math (chained-job "
+                              "resume, OFFICEDB_MODIFICATIONS.md item 25). 0 (default) reproduces original "
+                              "behavior exactly.")
+    parser.add_argument("--rounds_this_run", type=int, default=None,
+                         help="Actual num_rounds this process executes (default: falls back to --rounds, i.e. "
+                              "the original one-shot behavior). See OFFICEDB_MODIFICATIONS.md item 25.")
+    parser.add_argument("--experiment_dir", type=str, default=None,
+                         help="If set, used verbatim as the experiment directory instead of a fresh "
+                              "datetime.now()-timestamped one -- required for chained jobs to find each "
+                              "other's checkpoints/CL state. Default (None) reproduces original behavior "
+                              "exactly.")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Optional torch/numpy/random seed. Default None reproduces today's unseeded "
+                              "behavior.")
     args = parser.parse_args()
 
     print("Running with the following arguments:")
