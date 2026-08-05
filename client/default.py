@@ -66,7 +66,7 @@ class FlowerClient(fl.client.NumPyClient):
 
 class FlowerClientCL(fl.client.NumPyClient):
 	def __init__(self, cid, net, trainloader, valloader, testloader, epochs, y_labels, cl_strategy, agent_config, nrounds, path, DEVICE, num_clients,
-	             strat_name, params, n_tasks=2, active_idx_per_task=None, cumulative_idx_per_task=None):
+	             strat_name, params, n_tasks=2, active_idx_per_task=None, cumulative_idx_per_task=None, round_offset=0):
 		self.cid = cid
 		# self.net = net
 		self.trainloaders = trainloader
@@ -94,14 +94,18 @@ class FlowerClientCL(fl.client.NumPyClient):
 		# See OFFICEDB_MODIFICATIONS.md.
 		self.active_idx_per_task = active_idx_per_task
 		self.cumulative_idx_per_task = cumulative_idx_per_task
+		# Chained-job resume (OFFICEDB_MODIFICATIONS.md item 23): 0 reproduces original behavior exactly.
+		self.round_offset = round_offset
 
 	def _task_idx(self, server_round):
-		return min((server_round - 1) // self.rounds_per_task, self.n_tasks - 1)
+		effective_round = server_round + self.round_offset
+		return min((effective_round - 1) // self.rounds_per_task, self.n_tasks - 1)
 
 	def _is_boundary(self, server_round, task_idx):
 		# Last round of a task (except the last task, which has no further
 		# task to prepare importance/replay for).
-		return (server_round % self.rounds_per_task == 0) and (task_idx < self.n_tasks - 1)
+		effective_round = server_round + self.round_offset
+		return (effective_round % self.rounds_per_task == 0) and (task_idx < self.n_tasks - 1)
 
 	def get_parameters(self, config):
 		print(f"[Client {self.cid}] get_parameters")
@@ -185,7 +189,7 @@ class FlowerClientCL(fl.client.NumPyClient):
 
 class FlowerClient_NR(fl.client.NumPyClient):
 	def __init__(self, cid, net, trainloader, valloader, testloader, epochs, y_labels, cl_strategy, agent_config, nrounds, path, DEVICE, num_clients,
-	             strat_name, params, n_tasks=2, active_idx_per_task=None, cumulative_idx_per_task=None):
+	             strat_name, params, n_tasks=2, active_idx_per_task=None, cumulative_idx_per_task=None, round_offset=0):
 		self.cid = cid
 		# self.net = net
 		self.trainloaders = trainloader
@@ -209,12 +213,16 @@ class FlowerClient_NR(fl.client.NumPyClient):
 		# FCL Axis A masking -- see FlowerClientCL.
 		self.active_idx_per_task = active_idx_per_task
 		self.cumulative_idx_per_task = cumulative_idx_per_task
+		# Chained-job resume (OFFICEDB_MODIFICATIONS.md item 23): 0 reproduces original behavior exactly.
+		self.round_offset = round_offset
 
 	def _task_idx(self, server_round):
-		return min((server_round - 1) // self.rounds_per_task, self.n_tasks - 1)
+		effective_round = server_round + self.round_offset
+		return min((effective_round - 1) // self.rounds_per_task, self.n_tasks - 1)
 
 	def _is_boundary(self, server_round, task_idx):
-		return (server_round % self.rounds_per_task == 0) and (task_idx < self.n_tasks - 1)
+		effective_round = server_round + self.round_offset
+		return (effective_round % self.rounds_per_task == 0) and (task_idx < self.n_tasks - 1)
 
 	def get_parameters(self, config):
 		print(f"[Client {self.cid}] get_parameters")
@@ -243,6 +251,7 @@ class FlowerClient_NR(fl.client.NumPyClient):
 			task_count = 0
 
 		server_round = config["server_round"]
+		effective_round = server_round + self.round_offset  # OFFICEDB_MODIFICATIONS.md item 23
 		task_idx = self._task_idx(server_round)
 		train_loader = self.trainloaders[task_idx][int(self.cid)]
 		is_boundary = self._is_boundary(server_round, task_idx)
@@ -264,7 +273,7 @@ class FlowerClient_NR(fl.client.NumPyClient):
 			memory = {task_count: Memory()}
 			memory[task_count].update(storage)
 			peak_ram = self.strat.learn_batch(task_count, memory, train_loader, learn_nr=False)
-			if server_round == int(self.nrounds):
+			if effective_round == int(self.nrounds):
 				if os.path.exists(f'{self.path}/reg{int(self.cid)}.pkl'):
 					os.remove(f'{self.path}/reg{int(self.cid)}.pkl')
 		if not os.path.exists(f'{self.path}/clientwise'):
