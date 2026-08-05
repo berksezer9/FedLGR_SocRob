@@ -387,17 +387,24 @@ def predict_gen_distil(net, trainloader, DEVICE, batch_size=16):
 	return numpy.asarray(outputs).reshape((len(trainloader) * batch_size, num_classes))
 
 
-def get_eval_fn(net, testloader, y_labels, DEVICE):
+def get_eval_fn(net, testloader, y_labels, DEVICE, checkpoint_path=None):
+	# checkpoint_path: optional, dumps the aggregated global model each round
+	# via _dump_global_params -- same pattern as get_eval_fn_cl's checkpoint_path
+	# (added for Track 2 federated domain-transfer; see OFFICEDB_MODIFICATIONS.md).
+	# None (default) reproduces original behavior exactly -- no callers besides
+	# main.py's FedAvg branch pass this today.
 	def evaluate(server_round: int, weights: fl.common.NDArrays, config: Dict[str, Scalar]) -> Optional[Tuple[float, Dict[str, Scalar]]]:
 		# print(config.keys())
 		net.train()
 		params_dict = zip(net.state_dict().keys(), weights)
 		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
 		net.load_state_dict(state_dict, strict=True)
+		if checkpoint_path is not None:
+			_dump_global_params(net, checkpoint_path)
 		loss, avg_pearson, avg_rmse = test(net, testloader, y_labels, DEVICE)
 		print("Round %s, Loss %s, Pearson %s, RMSE %s" % (server_round, loss, avg_pearson, avg_rmse))
 		return loss, {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
-	
+
 	return evaluate
 
 

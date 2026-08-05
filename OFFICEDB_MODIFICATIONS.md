@@ -865,6 +865,97 @@ replay more samples per epoch and would only make this worse. Retried as jobs
 32894066/32894067 (chunk2/chunk3, resumed from chunk1's checkpoint via `--experiment_dir`, same
 mechanism as any other chained resume).
 
+## 26. `utils.py`, `main.py` -- plain-FL checkpoint hook for Track 2 federated domain-transfer
+
+**Status: implemented** 2026-08-05, sign-off obtained before editing (per CLAUDE.md's "flag,
+don't silently do" rule for this fork).
+
+**Why**: confirmed by direct read of `client/{default,fedBN,fedRoot}.py` that **no completed FL
+run of any strategy has ever persisted a complete, loadable model**. `FlowerClient.fit()`/
+`evaluate()` (`client/default.py`, plain FedAvg/FedOptAdam/FedProx/FedDistill) write only
+per-round CSV metrics, nothing to disk. `FlowerClient_BN` (`client/fedBN.py`) saves
+`mod_bn{cid}.pkl` -- local BatchNorm params only. `FlowerClient_Root.fit()`
+(`client/fedRoot.py:145,150`) saves `mod{cid}.pkl` -- literally `self.net.fc_module.state_dict()`,
+the personalized head only; the aggregated root/`conv_module` is never written anywhere. Worse
+than initially assumed for FedRoot: `main.py`'s `base=='FedAvg'` branch previously passed **no
+`evaluate_fn` at all** to the strategy -- there wasn't even a per-round central hook to begin
+with, unlike the plain strategies which at least had a transient (never-persisted) one via
+`get_eval_fn`. Needed for Track 2's federated-vs-centralized domain-transfer comparison
+(`docs/officedb_spine_implementation_plan.md` §3) -- without this, no federated checkpoint
+exists to evaluate.
+
+**Fix**: mirrors the existing FCL path's checkpoint mechanism (item 25 above,
+`_dump_global_params`/`make_checkpoint_hook`) instead of inventing a new one.
+- `utils.py`: `get_eval_fn(net, testloader, y_labels, DEVICE, checkpoint_path=None)` gained the
+  optional `checkpoint_path` param (previously CL-only, via `get_eval_fn_cl`). When set, its
+  `evaluate()` closure calls `_dump_global_params(net, checkpoint_path)` right after loading each
+  round's aggregated weights into `net` -- same call, same place `get_eval_fn_cl` already makes
+  it. Default `None` reproduces prior behavior exactly for every other caller.
+- `main.py`: only 2 of the existing call sites pass a `checkpoint_path` -- the plain `FedAvg`
+  branch (`get_eval_fn(central_model, ..., checkpoint_path=f"{path}/global_params.pkl")`) and the
+  FedRoot `base=='FedAvg'` branch, which gains
+  `evaluate_fn=make_checkpoint_hook(central_model.conv_module, f"{path}/global_params.pkl")` --
+  same `make_checkpoint_hook` item 25 already validated for the FCL path, always returns `None`,
+  reproducing the prior "no centralized eval" behavior exactly and adding only the checkpoint
+  side effect. `FedProx`/`FedOptAdam`/`FedDistill`/`FedBN` (plain and FedRoot-base) call sites are
+  untouched -- deliberately scoped to only the 2 combos Track 2 needs
+  (by-robot FedAvg + FedRoot-base=FedAvg), not a general checkpoint-everywhere change.
+
+**Checkpoint contents, important for the consuming eval script**: the `FedAvg` branch's
+`global_params.pkl` is a **complete `Net` state_dict**, directly loadable by
+`transfer_eval.py`/`pretrain.py`'s existing `model.load_state_dict(pickle.load(f))` convention.
+The FedRoot branch's `global_params.pkl` is the **shared root (`conv_module`) only** -- getting a
+complete per-robot personalized model requires combining it with that robot's own `mod{cid}.pkl`
+(`fc_module`, already saved today, unaffected by this change). That assembly is done in
+`fedlgr_officedb/` code, not here.
+
+**Risk / blast radius**: additive-only, gated behind a default-`None`/previously-absent parameter;
+no existing strategy/branch's runtime behavior changes except the 2 combos above gaining a
+disk-write side effect. Isolated to this worktree's submodule checkout (each git worktree has an
+independent checkout); the currently-running/queued FCL Axis A jobs (`main_fcl.py`, `run_fcl.py`)
+use `get_eval_fn_cl`/`make_checkpoint_hook` via a separate code path untouched by this item, and
+already-running Python processes don't re-read source after import in any case.
+
+## 27. `main.py` -- optional `--seed` for the plain-FL/FedRoot multi-seed re-run
+
+**Status: implemented** 2026-08-05, sign-off obtained before editing.
+
+**Why**: Track 2's federated-vs-centralized domain-transfer comparison needs the same multi-seed
+reliability treatment `pretrain.py`/`transfer_eval.py` already give the centralized ceiling
+(`results/fedlgr_officedb/domain_transfer/crossdomain_seed_reliability/`, item 24). `main.py`
+(plain FL/FedRoot) had no `--seed` argument at all -- just the unconditional module-level
+`torch.manual_seed(1024)`/`np.random.seed(1024)` (lines 22, 25), unlike `pretrain.py`/
+`transfer_eval.py`/`main_fcl.py`, which all already got this treatment. Confirmed the seed
+actually matters here (not a no-op): `dataloader/utils.py`'s `load_datasets` calls
+`np.random.permutation(len(data))` for `data_permutation`, which reads the global NumPy RNG state
+-- varies with the seed. `--split_col Split` (already passed for OfficeDB) keeps the train/test
+boundary itself fixed from the CSV, so seed variation changes weight init + shuffling/permutation
+only, the same protocol as `pretrain.py`'s existing multi-seed rerun.
+
+**Fix**: mirrors `pretrain.py`'s exact pattern (its own `run()`, lines 15-27) rather than
+inventing a new one. `main.py`'s `run(args)` gained, at its very top (before `client_fn`/dataset
+loading/model init):
+```python
+if args.seed is not None:
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+```
+plus a new `--seed` argparse arg (default `None`) and `import random` (previously unimported in
+this file). The pre-existing module-level `torch.manual_seed(1024)`/`np.random.seed(1024)` are
+left untouched, so omitting `--seed` reproduces original behavior byte-for-byte -- identical
+"unset = unseeded original" convention as `pretrain.py`.
+
+**`fedlgr_officedb/run_fl.py`** (our own driver, not vendor) gained a matching `--seed`
+passthrough into `build_command`'s `main.py` invocation. Note: it does **not** auto-suffix
+`--output` per seed -- the caller (the 2b re-run submission script) must pass a seed-distinct
+`--output` per run, or different seeds' `global_params.pkl`/`mod{cid}.pkl` checkpoints will
+clobber each other in the same directory.
+
+**Risk / blast radius**: additive-only, gated behind a default-`None` argument; every existing
+call site (all real `fl_strategy.sbatch`/`submit_fl_sweep.py` jobs, none of which pass `--seed`)
+is unaffected. Same isolation/already-running-process caveats as item 26 apply.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

@@ -14,7 +14,7 @@ from client.fedRoot import FlowerClient_Root
 from dataloader.utils import *
 
 from utils import plot_results, get_parameters, set_parameters, train, test, predict, predict_gen, get_parameters_bn, \
-    get_eval_fn, get_eval_fn_bn, extract_metrics_gpu_csv, truncate_float
+    get_eval_fn, get_eval_fn_bn, extract_metrics_gpu_csv, truncate_float, make_checkpoint_hook
 
 from metrics.computation import GPUUsage, RAMU, CPUUsage
 from distutils.util import strtobool
@@ -23,6 +23,7 @@ torch.manual_seed(1024)
 import numpy as np
 import pandas as pd
 np.random.seed(1024)
+import random
 import psutil
 import gc
 from typing import Dict, List, Optional, Tuple
@@ -127,6 +128,17 @@ def savecomp(output, strat, rambef, ramaf, cpubef, cpuaf, gpubeff, gpuaf):
 
 
 def run(args):
+    # Multi-seed reruns (Track 2 federated domain-transfer, matching
+    # pretrain.py's existing --seed convention) need data_permutation/model
+    # init/DataLoader shuffling to actually vary per --seed -- reseed before
+    # any of that happens. --seed is optional and unset by default, so the
+    # module-level torch.manual_seed(1024)/np.random.seed(1024) above still
+    # give byte-for-byte original behavior when omitted (see OFFICEDB_MODIFICATIONS.md).
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
     def client_fn(cid):
         return FlowerClient(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
                             y_labels=y_labels, num_clients=int(n_cl), DEVICE=DEVICE, path=path)
@@ -242,7 +254,12 @@ def run(args):
                     # initial_parameters=fl.common.ndarrays_to_parameters(params),
                     on_fit_config_fn=fit_config,
                     on_evaluate_config_fn=evaluate_config,
-                    evaluate_fn=get_eval_fn(central_model, testloader=testloader, DEVICE=DEVICE, y_labels=y_labels)
+                    # checkpoint_path: persists the aggregated global model each
+                    # round (Track 2 federated domain-transfer -- see
+                    # OFFICEDB_MODIFICATIONS.md). Other plain strategies below
+                    # (FedProx/FedOptAdam/FedDistill/FedBN) are unchanged.
+                    evaluate_fn=get_eval_fn(central_model, testloader=testloader, DEVICE=DEVICE, y_labels=y_labels,
+                                             checkpoint_path=f"{path}/global_params.pkl")
                 )
                 client_function = client_fn
             elif strat == 'FedProx':
@@ -335,7 +352,16 @@ def run(args):
                             min_available_clients=int(n_cl),
                             # initial_parameters=fl.common.ndarrays_to_parameters(params),
                             on_fit_config_fn=fit_config,
-                            on_evaluate_config_fn=evaluate_config
+                            on_evaluate_config_fn=evaluate_config,
+                            # make_checkpoint_hook: no centralized eval existed here
+                            # before (evaluate_fn was previously unset for FedRoot) --
+                            # this hook always returns None, reproducing that "no
+                            # centralized eval" behavior exactly, and adds only the
+                            # side effect of persisting the aggregated root/conv_module
+                            # each round (Track 2 federated domain-transfer -- see
+                            # OFFICEDB_MODIFICATIONS.md). Other FedRoot bases below
+                            # (FedProx/FedOptAdam/FedBN/FedDistill) are unchanged.
+                            evaluate_fn=make_checkpoint_hook(central_model.conv_module, f"{path}/global_params.pkl")
                         )
                         client_function = client_fn_root
 
@@ -461,6 +487,10 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--base", type=str, default="FedAvg", help="Default base for FedRoot Only")
     parser.add_argument("-t", "--processor_type", type=str, default="cpu", help="Processor Type")
     parser.add_argument("--num_classes", type=int, default=8, help="Number of action output heads (8=MANNERS-DB, 9=OfficeDB)")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Seed random/numpy/torch before data_permutation/model init/training, for "
+                              "multi-seed reruns (Track 2 federated domain-transfer). Default None: "
+                              "unseeded override (original hardcoded-1024 behavior, unchanged).")
     parser.add_argument("--group_col", type=str, default=None, help="Column assigning clients by group (robot/room) instead of random_split; #unique values must equal #clients")
     parser.add_argument("--split_col", type=str, default=None, help="Column with pre-computed train/test labels, used instead of the internal random 75/25 split")
     parser.add_argument("--action_cols", type=str, default=None, help="Comma-separated action column names (default: MANNERS-DB's 8 hardcoded names)")
