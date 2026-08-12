@@ -1020,7 +1020,12 @@ unsafe-for-BatchNorm formula, matching `FedOptAdamStrategy`'s own default semant
 
 **`main.py`**: new `elif strat == 'FedNova':` branch (mirrors the `FedOptAdam` branch just above
 it -- same `initial_parameters`/`buffer_mask` construction, `client_fn`/plain `FlowerClient`, no
-FedRoot variant added). Deliberately **not** added to the `strategy == 'all'` hardcoded list
+FedRoot variant added -- deliberately out of scope for now, per user decision 2026-08-12). Also
+passes `checkpoint_path=f"{path}/global_params.pkl"` to `get_eval_fn` (same Track 2 federated
+domain-transfer hook item 26 added for the plain `FedAvg` branch), added opportunistically at the
+user's request since it's a one-line reuse of an already-tested kwarg -- not required for this
+item's own by-robot-only scope, but there in case a later session wants FedNova's checkpoint for
+domain-transfer work. Deliberately **not** added to the `strategy == 'all'` hardcoded list
 (`['FedAvg', 'FedBN', 'FedOptAdam', 'FedProx', 'FedDistill', 'FedRoot']`) -- the five-point plan
 scopes FedNova to the `by-robot` partition only, single-seed, not a second full sweep across
 every partition; keeping it out of `all` means existing/future `--strategy all` sweeps on other
@@ -1030,8 +1035,12 @@ partitions are unaffected, and `FedNova` must be requested explicitly
 **Risk / blast radius**: additive-only new strategy branch + one new client fit-metrics key
 (ignored elsewhere). No existing strategy's code path, weighting, or output changes. Smoke-tested
 via `smoke_test/run_smoke_test.sh`-style `main.py --strategy FedNova` invocation against synthetic
-data before any real Slurm job (see this item's companion smoke-test log/output, not committed
-here -- ephemeral verification only).
+data before any real Slurm job (job 33533156, full 9-step suite; jobs 33537206/33538001 hit
+unrelated node-level infra flakiness -- a Slurm TIMEOUT stuck at import and a `No space left on
+device` at `ray.init()`, both on a busy/full shared node, matching item 22's documented Ray/VCE
+hang risk -- job 33538472 completed cleanly on a different node and confirmed
+`global_params.pkl` is written and loads back as a 321-tensor state dict with no NaNs). See this
+item's companion smoke-test logs, not committed here -- ephemeral verification only.
 
 ## Not changed
 
