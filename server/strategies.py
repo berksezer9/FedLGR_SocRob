@@ -102,6 +102,125 @@ class FedProxWithAccuracyMetric(fl.server.strategy.FedProx):
 		return loss_aggregated, {'avg_pearson_score': pcc_aggregated, 'avg_rmse':rmse}
 
 
+class FedNovaStrategy(fl.server.strategy.FedAvg):
+	"""FedNova (Wang et al., NeurIPS 2020, https://arxiv.org/abs/2007.07481):
+	normalizes each client's update by how many local steps it actually took
+	before averaging, correcting FedAvg's implicit bias toward clients that
+	run more local computation (objective inconsistency under heterogeneous
+	local step counts). See OFFICEDB_MODIFICATIONS.md item 28.
+
+	Per-client normalized update: d_i = (x^t - y_i) / tau_i, where x^t is the
+	global model this round started from, y_i is client i's returned weights,
+	and tau_i is client i's local step count (`local_steps` in its fit()
+	metrics -- client/default.py's FlowerClient.fit()). Server step:
+	x^{t+1} = x^t - tau_eff * sum_i(p_i * d_i), with p_i = n_i / sum(n_j)
+	(n_i = FitRes.num_examples, same weighting FedAvg already uses) and
+	tau_eff = sum_i(p_i * tau_i).
+
+	Unlike FedAvg's plain weighted average (a convex combination, so always
+	bounded within the clients' value range), this is a genuine
+	extrapolation -- sum_i(p_i * tau_eff / tau_i) need not equal 1, so the
+	result can overshoot past x^t/y_i's range. Applied to BatchNorm
+	running_var, that overshoot can push it negative -> NaN in the very next
+	forward pass, the exact failure mode item 19 already found for
+	FedOptAdamStrategy's unmasked FedAdam. Reuses that item's fix: buffers
+	(identified via `buffer_mask`, e.g. `bn_buffer_mask(...)`) are instead
+	plain weighted-averaged; `buffer_mask=None` (default) applies the
+	FedNova extrapolation everywhere, matching FedOptAdamStrategy's own
+	`buffer_mask=None` default semantics.
+	"""
+
+	def __init__(self, *args, buffer_mask: Optional[List[bool]] = None, **kwargs):
+		if kwargs.get("initial_parameters") is None:
+			raise ValueError(
+				"FedNovaStrategy requires initial_parameters -- it needs the "
+				"pre-round global weights (self.current_weights) to compute each "
+				"client's normalized delta, unlike plain FedAvg which only "
+				"averages the clients' returned weights directly."
+			)
+		super().__init__(*args, **kwargs)
+		self.current_weights = parameters_to_ndarrays(kwargs["initial_parameters"])
+		self.buffer_mask = buffer_mask
+
+	def aggregate_fit(
+		self,
+		server_round: int,
+		results: List[Tuple[ClientProxy, FitRes]],
+		failures: List[Any],
+	) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+		_require_results(results, failures, "fit", server_round)
+		if not self.accept_failures and failures:
+			return None, {}
+
+		total_examples = sum(fit_res.num_examples for _, fit_res in results)
+		tau_effective = 0.0
+		# (p_i, delta_i, client_weights) per client -- client_weights kept
+		# around (not just delta_i) so the buffer branch below can plain-
+		# average the clients' raw returned values without re-deserializing
+		# fit_res.parameters a second time per buffer index.
+		per_client: List[Tuple[float, List[np.ndarray], List[np.ndarray]]] = []
+		for _, fit_res in results:
+			tau_i = fit_res.metrics.get("local_steps")
+			if not tau_i:
+				raise RoundFailedError(
+					f"fit round {server_round}: a client returned no (or zero) "
+					"'local_steps' fit-metric -- FedNovaStrategy requires it "
+					"(client/default.py's FlowerClient.fit() sets it; using a "
+					"different client class with FedNova is unsupported). See "
+					"OFFICEDB_MODIFICATIONS.md item 28."
+				)
+			p_i = fit_res.num_examples / total_examples
+			tau_effective += p_i * tau_i
+			client_weights = parameters_to_ndarrays(fit_res.parameters)
+			delta_i = [
+				(x - y) / tau_i for x, y in zip(self.current_weights, client_weights)
+			]
+			per_client.append((p_i, delta_i, client_weights))
+
+		aggregated_delta = [np.zeros_like(x) for x in self.current_weights]
+		for p_i, delta_i, _ in per_client:
+			for j, d in enumerate(delta_i):
+				aggregated_delta[j] = aggregated_delta[j] + p_i * d
+
+		new_weights = []
+		for j, (x, agg) in enumerate(zip(self.current_weights, aggregated_delta)):
+			if self.buffer_mask and self.buffer_mask[j]:
+				# Plain weighted average of the clients' returned buffer values
+				# instead of the FedNova extrapolation -- see class docstring /
+				# item 28 (mirrors item 19's FedOptAdamStrategy fix).
+				new_weights.append(
+					sum(p_i * client_weights[j] for p_i, _, client_weights in per_client)
+				)
+			else:
+				new_weights.append(x - tau_effective * agg)
+
+		self.current_weights = new_weights
+
+		metrics_aggregated = {}
+		if self.fit_metrics_aggregation_fn:
+			fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
+			metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
+		return ndarrays_to_parameters(new_weights), metrics_aggregated
+
+	def aggregate_evaluate(
+		self,
+		rnd: int,
+		results: List[Tuple[ClientProxy, EvaluateRes]],
+		failures: List[BaseException],
+	) -> Tuple[Optional[float], Dict[str, Scalar]]:
+		"""Aggregate evaluation losses using weighted average."""
+		_require_results(results, failures, "evaluate", rnd)
+		if not self.accept_failures and failures:
+			return None, {}
+		loss_aggregated = weighted_avg([(evaluate_res.num_examples, evaluate_res.loss) for _, evaluate_res in results])
+		pcc_aggregated = weighted_avg(
+			[(evaluate_res.num_examples, evaluate_res.metrics['avg_pearson_score']) for _, evaluate_res in results])
+		rmse = weighted_avg(
+			[(evaluate_res.num_examples, evaluate_res.metrics['avg_rmse']) for _, evaluate_res in results])
+
+		return loss_aggregated, {'avg_pearson_score': pcc_aggregated, 'avg_rmse': rmse}
+
+
 class FedOptAdamStrategy(fl.server.strategy.FedAdam):
 	# Was fl.server.strategy.FedAvg with a hand-rolled `aggregate(self, reports)`
 	# override -- Flower's Strategy interface calls `aggregate_fit(self,

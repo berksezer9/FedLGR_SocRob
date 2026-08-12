@@ -5,7 +5,8 @@ import flwr as fl
 import torch.nn as nn
 from datetime import datetime
 
-from server.strategies import FedAvgWithAccuracyMetric, FedProxWithAccuracyMetric, FedOptAdamStrategy, bn_buffer_mask
+from server.strategies import FedAvgWithAccuracyMetric, FedProxWithAccuracyMetric, FedOptAdamStrategy, \
+    FedNovaStrategy, bn_buffer_mask
 from server.utils import fit_config, evaluate_config
 
 from client.fedBN import FlowerClient_BN, FlowerClient_BN_Root
@@ -290,6 +291,22 @@ def run(args):
                     initial_parameters=fl.common.ndarrays_to_parameters(get_parameters(net)),
                     buffer_mask=bn_buffer_mask(net.state_dict().keys()),
                     eta=0.01, tau=1e-3,
+                    on_fit_config_fn=fit_config,
+                    on_evaluate_config_fn=evaluate_config,
+                    evaluate_fn=get_eval_fn(central_model, testloader=testloader, DEVICE=DEVICE, y_labels=y_labels)
+                )
+                client_function = client_fn
+
+            elif strat == 'FedNova':
+                # FedNova (OFFICEDB_MODIFICATIONS.md item 28): normalizes each
+                # client's update by its local step count before averaging.
+                # Needs initial_parameters + buffer_mask for the same reason
+                # FedOptAdam does just above -- self.current_weights tracking
+                # and BatchNorm-buffer protection (item 19's fix, reused).
+                strategy = FedNovaStrategy(
+                    min_available_clients=int(n_cl),
+                    initial_parameters=fl.common.ndarrays_to_parameters(get_parameters(net)),
+                    buffer_mask=bn_buffer_mask(net.state_dict().keys()),
                     on_fit_config_fn=fit_config,
                     on_evaluate_config_fn=evaluate_config,
                     evaluate_fn=get_eval_fn(central_model, testloader=testloader, DEVICE=DEVICE, y_labels=y_labels)
