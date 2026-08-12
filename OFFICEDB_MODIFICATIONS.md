@@ -1012,6 +1012,92 @@ not a blocker; check `sacct -j 33540387` for its outcome.
 `create_dataset_gen`), both dead code for every other CL strategy (EWC/EWCOnline/SI/MAS/NR never
 call them). No effect on any already-completed non-LGR result.
 
+## 29. `server/strategies.py`, `main.py`, `client/default.py` -- add FedNova strategy
+
+**Status: implemented** 2026-08-12, part of the ICRA 2027 five-point plan's item 2 ("Extend FL
+strategy coverage -- FedNova (+ SCAFFOLD)",
+`docs/paper_prep_2027/five_point_plan_2026-08-12.md`). Implemented on a separate worktree/branch
+(`fedlgr_officedb-fednova`, forked off `fedlgr_officedb`) to avoid clashing with other
+concurrent-session work on this repo; merged back once smoke-tested. SCAFFOLD (moderate cost --
+client-side control-variate state) is deliberately deferred to a later session, per the plan.
+
+**Why**: WS1's FL-baseline-coverage survey (`docs/paper_prep_2027/ws1_method_backbone_selection.md`)
+found FedNova (Wang et al., NeurIPS 2020, https://arxiv.org/abs/2007.07481) is the
+cheapest-to-add, most commonly-expected "why isn't this here" baseline in the non-IID vision-FL
+literature (NIID-Bench, FedRS-Bench, the FedProj baseline set) -- a server-side
+aggregation-only reweighting, addable in the same shape as the existing `FedOptAdamStrategy`
+Flower subclass (item 17/19), no client-training-loop change needed.
+
+**What FedNova corrects**: FedAvg implicitly favors clients that take more local SGD steps
+(more local epochs and/or more local data) -- their update simply moves further, and a plain
+weighted average by `num_examples` doesn't fully cancel that out when local step *counts* differ,
+not just data volume. FedNova instead normalizes each client's update to a per-step-average
+direction before combining, removing that bias ("objective inconsistency" in the paper's terms).
+
+**Client-side change** (`client/default.py`, `FlowerClient.fit()`): the fit-metrics dict, unused
+before this (`{}`), now includes `local_steps` = `self.epochs * len(self.trainloader)` -- the
+total local SGD step count for this client this round. `self.epochs` is a single global
+`--epochs` CLI value shared by every client (not per-client in this codebase), so this varies
+across clients only through `len(self.trainloader)` (client data volume) -- i.e., FedNova
+corrects for the same client-data-imbalance signal `FitRes.num_examples` already reflects, just
+via a different (multiplicative-normalization, not weighted-average) mechanism. Additive-only:
+every other strategy's `aggregate_fit` either never reads `fit_res.metrics` or only aggregates it
+through `fit_metrics_aggregation_fn`, unset (`None`) everywhere except `FedNovaStrategy` -- no
+behavior change for `FedAvg`/`FedProx`/`FedOptAdam`/`FedBN`/`FedDistill`/`FedRoot`.
+
+**Server-side change** (`server/strategies.py`, new `FedNovaStrategy(fl.server.strategy.FedAvg)`):
+implements the paper's normalized-averaging update directly (flwr has no built-in FedNova, unlike
+FedAdam/FedYogi/FedAdagrad) --
+```
+d_i          = (x^t - y_i) / tau_i        # per-client normalized delta
+p_i          = n_i / sum(n_j)             # same weighting FedAvg/flwr already use
+tau_eff      = sum_i(p_i * tau_i)
+x^{t+1}      = x^t - tau_eff * sum_i(p_i * d_i)
+```
+where `x^t` is `self.current_weights` (tracked the same way `FedOptAdamStrategy` tracks it --
+requires `initial_parameters`, raises `ValueError` at construction if omitted), `y_i` is client
+i's returned weights, and `tau_i` is `local_steps` from that client's fit metrics (raises
+`RoundFailedError` if a client's fit result is missing it, rather than silently defaulting --
+same fail-fast philosophy as item 22's `_require_results`).
+
+**BatchNorm-buffer risk, found before running anything (by inspection, applying item 19's
+lesson directly -- not rediscovered empirically this time)**: FedAvg's weighted average is a
+convex combination (`sum_i(p_i) == 1`), so it can never leave the range of the values being
+averaged. FedNova's update is *not* convex in the same sense --
+`sum_i(p_i * tau_eff / tau_i)` only equals 1 when every client's `tau_i` is identical, so in
+general the update is a genuine extrapolation past `x^t`/`y_i`'s range. Applied to BatchNorm's
+`running_var` (which must stay non-negative), that extrapolation risks the exact NaN failure
+mode item 19 found for unmasked `FedOptAdamStrategy`/`FedAdam`. Fixed the same way: `FedNovaStrategy`
+takes an optional `buffer_mask` constructor kwarg (`bn_buffer_mask(net.state_dict().keys())`,
+same helper item 19 added), and `main.py`'s new `FedNova` branch passes it -- buffer indices get
+a plain weighted average of the clients' returned buffer values instead of the FedNova
+extrapolation; `buffer_mask=None` (unused by any real call site here) would reproduce the raw,
+unsafe-for-BatchNorm formula, matching `FedOptAdamStrategy`'s own default semantics.
+
+**`main.py`**: new `elif strat == 'FedNova':` branch (mirrors the `FedOptAdam` branch just above
+it -- same `initial_parameters`/`buffer_mask` construction, `client_fn`/plain `FlowerClient`, no
+FedRoot variant added -- deliberately out of scope for now, per user decision 2026-08-12). Also
+passes `checkpoint_path=f"{path}/global_params.pkl"` to `get_eval_fn` (same Track 2 federated
+domain-transfer hook item 26 added for the plain `FedAvg` branch), added opportunistically at the
+user's request since it's a one-line reuse of an already-tested kwarg -- not required for this
+item's own by-robot-only scope, but there in case a later session wants FedNova's checkpoint for
+domain-transfer work. Deliberately **not** added to the `strategy == 'all'` hardcoded list
+(`['FedAvg', 'FedBN', 'FedOptAdam', 'FedProx', 'FedDistill', 'FedRoot']`) -- the five-point plan
+scopes FedNova to the `by-robot` partition only, single-seed, not a second full sweep across
+every partition; keeping it out of `all` means existing/future `--strategy all` sweeps on other
+partitions are unaffected, and `FedNova` must be requested explicitly
+(`--strategy FedNova`/`fedlgr_officedb/run_fl.py --strategy FedNova`).
+
+**Risk / blast radius**: additive-only new strategy branch + one new client fit-metrics key
+(ignored elsewhere). No existing strategy's code path, weighting, or output changes. Smoke-tested
+via `smoke_test/run_smoke_test.sh`-style `main.py --strategy FedNova` invocation against synthetic
+data before any real Slurm job (job 33533156, full 9-step suite; jobs 33537206/33538001 hit
+unrelated node-level infra flakiness -- a Slurm TIMEOUT stuck at import and a `No space left on
+device` at `ray.init()`, both on a busy/full shared node, matching item 22's documented Ray/VCE
+hang risk -- job 33538472 completed cleanly on a different node and confirmed
+`global_params.pkl` is written and loads back as a 321-tensor state dict with no NaNs). See this
+item's companion smoke-test logs, not committed here -- ephemeral verification only.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

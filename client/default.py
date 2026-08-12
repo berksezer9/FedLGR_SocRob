@@ -52,7 +52,16 @@ class FlowerClient(fl.client.NumPyClient):
 			os.makedirs(f'{self.path}/clientwise')
 		with open(f'{self.path}/clientwise/ramu{int(self.cid)}.csv', 'a+') as f:
 			f.write(f'{config["server_round"]},{init_ram},{peak_ram},{peak_ram - init_ram}\n')
-		return self.get_parameters(config={}), len(self.trainloader), {}
+		# local_steps: total local SGD steps this round (epochs * batches) --
+		# FedNovaStrategy.aggregate_fit (server/strategies.py) needs this to
+		# normalize each client's update by how much local computation it
+		# actually did (OFFICEDB_MODIFICATIONS.md item 29). Additive-only: every
+		# other strategy either ignores unknown fit-metrics keys entirely or
+		# only aggregates them through fit_metrics_aggregation_fn, which stays
+		# unset (None) everywhere except FedNovaStrategy, so this is a no-op
+		# for FedAvg/FedProx/FedOptAdam/FedBN/FedDistill/FedRoot.
+		local_steps = self.epochs * len(self.trainloader)
+		return self.get_parameters(config={}), len(self.trainloader), {"local_steps": local_steps}
 	
 	def evaluate(self, parameters, config):
 		if not os.path.exists(f'{self.path}/clientwise'):
