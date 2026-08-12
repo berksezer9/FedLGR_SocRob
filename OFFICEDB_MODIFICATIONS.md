@@ -956,6 +956,62 @@ clobber each other in the same directory.
 call site (all real `fl_strategy.sbatch`/`submit_fl_sweep.py` jobs, none of which pass `--seed`)
 is unaffected. Same isolation/already-running-process caveats as item 26 apply.
 
+## 28. `CL/default.py` -- LGR replay-buffer `DataLoader`s crash at task boundaries
+
+**Status: implemented** 2026-08-12, per the paper-prep five-point plan's Tier 1 item
+(`docs/paper_prep_2027/five_point_plan_2026-08-12.md` in the main repo).
+
+**Why**: `FedRoot`/`FedAvg` x `LGR` (generative replay, the vendor's own headline mechanism,
+arXiv 2405.15773) has been excluded from every FCL Axis A/B sweep so far
+(`docs/fedlgr_officedb_experiments.md`) because of a pre-existing vendor bug flagged during item
+25's chained-resume work: `create_dataset()`/`create_dataset_gen()` (used at the 2nd+ task
+boundary to mix real current-task data with pseudo-replayed prior-task data before training)
+each built their combined `DataLoader` with `batch_size=16, shuffle=True` and no `drop_last`.
+Whenever `len(combined_dataset) % 16 == 1`, the final batch has exactly 1 sample, which crashes
+training the moment it reaches a `BatchNorm` layer (`self.model.fc_module` in `create_dataset`'s
+caller, `self.generator`'s VAE in `create_dataset_gen`'s caller) -- `BatchNorm` needs >1 sample
+per channel to compute a batch statistic. Confirmed pre-existing (not introduced by the OfficeDB
+fork) and reproducible in the monolithic (non-chunked) path, not just chunked -- see item 25's
+"Two swaps from the original plan" note.
+
+**Fix**: added `drop_last=True` to both `DataLoader(combined_dataset, batch_size=16,
+shuffle=True, ...)` calls (`create_dataset`, `create_dataset_gen`) -- the same flag every other
+`DataLoader` in this class already uses (`predict_gen`, `predict_from_gen`,
+`predict_from_gen_gen`, all `drop_last=True`), so this brings `LGR`'s replay-mixing path in line
+with the rest of the class rather than introducing a new convention. No other change.
+
+**Trade-off, accepted**: dropping the remainder batch means up to 15 samples of that task
+boundary's combined (real + replayed) data go unused in that epoch. Given `combined_dataset` is
+`len(new_data) * 16` replayed samples plus the real per-task/per-client training data (typically
+in the hundreds for OfficeDB's by-robot/by-room partitions, never as small as 16), a dropped
+remainder of at most 15 is a small fraction of one epoch's data, not a meaningful shrinkage of
+the effective training set -- consistent with why `drop_last=True` is already the vendor's own
+default choice everywhere else this exact `batch_size=16` pattern appears in this file.
+
+**Verification**: smoke-tested via `fedlgr_officedb/slurm/smoke_fcl_lgr_icelake.sbatch`
+(`FedRoot`x`LGR`, real OfficeDB Axis A data, `--rounds 3 --epochs 1` so `rounds_per_task=1` and
+round 2 already reaches `task_count=1` -- the task-boundary branch that calls `create_dataset()`).
+Job 33538729 (2026-08-12, `gunes-sl3-cpu`/icelake): round 1 (`task_count=0`, pre-fix-irrelevant
+"first task" branch) completed cleanly for all 3 clients; round 2 (`task_count=1`) hit
+`create_dataset()` -- log shows "Learning LGR Data Mixed" (the call site) immediately followed by
+a clean, unbracketed `Epoch 1/1, Loss: <value>` print for multiple clients, which only prints
+after the *entire* `mixed_task_data` `DataLoader` has been iterated without exception -- i.e. the
+exact remainder-batch/`BatchNorm` crash this fix targets did not occur. (The job was later killed
+by its own `FL_ROUND_TIMEOUT`/Slurm wall-time -- unrelated infra mis-calibration, not a fix
+failure: LGR's boundary round runs 3 training phases per client (`Task 2` fc-training, "End to
+End Top Frozen" full-model training, generator retraining via `create_dataset_gen()`) vs. round
+1's 2, and 1200s wasn't enough headroom -- see the smoke sbatch script's own comments.) Combined
+with item 25's existing note that this crash was independently confirmed on a real (pre-fix) run,
+this is a confirmed pre-fix-crashes / post-fix-doesn't pair, the same standard used elsewhere in
+this file. A fully clean 3-round completion (job 33540387, `FL_ROUND_TIMEOUT=3600`,
+`--time=02:30:00`) was queued the same day to remove any residual ambiguity but had not started
+(`PD`/`Priority`) after 29 minutes in queue at the time of this commit -- optional confirmation,
+not a blocker; check `sacct -j 33540387` for its outcome.
+
+**Risk / blast radius**: touches only the `LGR` replay-mixing path (`create_dataset`,
+`create_dataset_gen`), both dead code for every other CL strategy (EWC/EWCOnline/SI/MAS/NR never
+call them). No effect on any already-completed non-LGR result.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

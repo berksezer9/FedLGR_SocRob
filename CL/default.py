@@ -963,7 +963,10 @@ class LatentGenerativeReplay(nn.Module):
 		combined_dataset = ConcatDataset([dataset1, dataset2])
 		
 		# Create a DataLoader for the combined dataset with shuffling
-		combined_dataloader = DataLoader(combined_dataset, batch_size=16, shuffle=True)
+		# drop_last=True: a remainder-of-1 final batch crashes BatchNorm at task
+		# boundaries (flagged in item 25, fixed in item 28, OFFICEDB_MODIFICATIONS.md),
+		# same as every other DataLoader in this class (predict_gen/predict_from_gen* above).
+		combined_dataloader = DataLoader(combined_dataset, batch_size=16, shuffle=True, drop_last=True)
 		return combined_dataloader
 	
 	def create_dataset_gen(self, new_data):
@@ -992,7 +995,10 @@ class LatentGenerativeReplay(nn.Module):
 		combined_dataset = ConcatDataset([dataset1, dataset2])
 		
 		# Create a DataLoader for the combined dataset with shuffling
-		combined_dataloader = DataLoader(combined_dataset, batch_size=16, shuffle=True)
+		# drop_last=True: a remainder-of-1 final batch crashes BatchNorm at task
+		# boundaries (flagged in item 25, fixed in item 28, OFFICEDB_MODIFICATIONS.md),
+		# same as every other DataLoader in this class (predict_gen/predict_from_gen* above).
+		combined_dataloader = DataLoader(combined_dataset, batch_size=16, shuffle=True, drop_last=True)
 		return combined_dataloader
 	
 	def loss_function(self, recon_x, x, mu, logvar, input_dim):
