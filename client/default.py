@@ -15,7 +15,7 @@ import torch
 from collections import OrderedDict
 import flwr as fl
 import sys
-from utils import get_parameters, set_parameters, train, test, predict, predict_gen
+from utils import get_parameters, set_parameters, train, train_scaffold, test, predict, predict_gen
 
 
 class FlowerClient(fl.client.NumPyClient):
@@ -71,6 +71,36 @@ class FlowerClient(fl.client.NumPyClient):
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
 		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
+
+
+class FlowerClientScaffold(FlowerClient):
+	"""SCAFFOLD (Karimireddy et al., ICML 2020) client: identical to
+	FlowerClient except for fit() -- the `parameters` this receives from
+	SCAFFOLDStrategy.configure_fit (server/strategies.py) are [model_weights,
+	correction] concatenated (correction = global_c - client_c for this
+	client, computed and owned server-side -- see that class's docstring for
+	why control-variate state isn't persisted client-side the way the CL
+	clients' reg{cid}.pkl/task{cid}.txt is). get_parameters/set_parameters
+	are inherited unchanged since they only ever see plain model weights (the
+	`weights` half, already split out below, before set_parameters is
+	called). See OFFICEDB_MODIFICATIONS.md item 31.
+	"""
+
+	def fit(self, parameters, config):
+		ramu = RAMU()
+		print(f"[Client {self.cid}] fit, config: {config}")
+		n_params = len(parameters) // 2
+		weights, correction = parameters[:n_params], parameters[n_params:]
+		self.set_parameters(weights)
+		init_ram = ramu.compute("TRAINING")
+		peak_ram = train_scaffold(self.net, self.trainloader, epochs=self.epochs, DEVICE=self.DEVICE,
+		                           correction=correction)
+		if not os.path.exists(f'{self.path}/clientwise'):
+			os.makedirs(f'{self.path}/clientwise')
+		with open(f'{self.path}/clientwise/ramu{int(self.cid)}.csv', 'a+') as f:
+			f.write(f'{config["server_round"]},{init_ram},{peak_ram},{peak_ram - init_ram}\n')
+		local_steps = self.epochs * len(self.trainloader)
+		return self.get_parameters(config={}), len(self.trainloader), {"local_steps": local_steps}
 
 
 class FlowerClientCL(fl.client.NumPyClient):

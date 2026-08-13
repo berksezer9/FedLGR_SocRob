@@ -1133,6 +1133,99 @@ way item 28 was.
 `fc_module`'s prior mode on exit, so no behavior change for callers relying on it staying in
 `.train()`/`.eval()` after these methods return.
 
+## 31. `server/strategies.py`, `main.py`, `client/default.py`, `utils.py` -- add SCAFFOLD strategy
+
+**Status: implemented** 2026-08-13, part of the ICRA 2027 five-point plan's item 2 (deliberately
+deferred from item 29's FedNova work, per that item's own note). Implemented on a separate
+worktree/branch (`scaffold`, forked off `officedb-adapt` at item 29, rebased onto item 30 once
+that landed concurrently -- checked out inside the outer repo's `fedlgr_officedb-scaffold`
+worktree/branch) to avoid clashing with other concurrent-session work on this repo; smoke-tested
+clean (see below), merged back into `officedb-adapt`.
+
+**Why**: WS1's FL-baseline-coverage survey
+(`docs/paper_prep_2027/ws1_method_backbone_selection.md`) found SCAFFOLD (Karimireddy et al.,
+ICML 2020, https://arxiv.org/abs/1910.06378) is the single most commonly-expected non-IID
+baseline missing from this benchmark's coverage, alongside FedNova -- "moderate cost" there
+specifically because of the client-side control-variate state its canonical form requires,
+unlike FedNova's server-side-only aggregation change.
+
+**What SCAFFOLD corrects**: under non-IID client data, plain local SGD/Adam steps drift toward
+each client's own local optimum ("client drift"), and FedAvg's weighted average doesn't undo
+that drift, only averages across it. SCAFFOLD adds a per-client control variate that's subtracted
+from (corrected toward) the global direction during local training, pulling each client's
+trajectory back toward the direction a centralized run would have taken.
+
+**Design decision: control-variate state lives server-side, not client-side.** The paper's
+canonical form persists a per-client control variate `c_i` across rounds inside the client. This
+codebase's clients are `fl.simulation.start_simulation` Ray VirtualClientEngine actors,
+re-instantiated fresh every round -- the existing FCL clients already work around this via disk
+pickles (`client/default.py`'s `reg{cid}.pkl`/`task{cid}.txt`). Rather than add a second, parallel
+disk-persistence mechanism for a third kind of per-client state, `SCAFFOLDStrategy`
+(`server/strategies.py`) keeps `self.global_c` and `self.client_c` (keyed by `ClientProxy.cid`) in
+the Strategy object itself, which -- unlike the client actors -- is a single object alive for the
+whole run already (exactly how `FedNovaStrategy`/`FedOptAdamStrategy` track `self.current_weights`
+across rounds). Every quantity SCAFFOLD's Option II control-variate update needs is either already
+known server-side (`x^t`, `c`, and `tau_i` via the `local_steps` fit-metric `FedNovaStrategy`
+already established the convention for) or is exactly what the client returns anyway (`y_i`), so
+nothing is lost by computing the update server-side instead of client-side.
+
+**Client-side change** (`client/default.py`, new `FlowerClientScaffold(FlowerClient)`): overrides
+only `fit()`. `SCAFFOLDStrategy.configure_fit` sends each client `[weights, correction]`
+concatenated (`correction = global_c - client_c[cid]`, doubling the *outgoing* payload only, not
+the client's return payload -- the client still returns plain trained weights + `local_steps`,
+identical in shape to `FedNovaStrategy`'s client contract). `fit()` splits that back into
+`weights`/`correction`, calls `utils.py`'s new `train_scaffold()` instead of `train()`, which adds
+`correction` to each trainable parameter's `.grad` after `backward()`, before `optimizer.step()`
+(BatchNorm buffer positions in `correction` are always zero -- a buffer has no `.grad`, so a
+correction there is meaningless, not just risky -- `train_scaffold` filters them out via an inline
+buffer-tag mask before zipping against `model.parameters()`, with an `assert` that fails fast if
+that alignment assumption is ever wrong for some future model architecture).
+
+**Server-side change** (`server/strategies.py`, new `SCAFFOLDStrategy(fl.server.strategy.FedAvg)`):
+```
+correction (sent to client i)  = global_c - client_c[i]
+x^{t+1}                        = sum_i(p_i * y_i)                          # plain FedAvg average
+c_i^+                          = c_i - global_c + (x^t - y_i) / (tau_i * local_lr)   # Option II
+global_c^+                     = global_c + (1/S) * sum_i(c_i^+ - c_i)     # S = sampled clients
+```
+`local_lr` (default matches `train_scaffold`'s hardcoded Adam `lr=0.001`) stands in for the
+paper's SGD step size -- SCAFFOLD's Option II formula and convergence theory are derived for SGD,
+not Adam; applying the correction to Adam's gradient anyway is the standard practical
+approximation other SCAFFOLD-on-Adam implementations use, not a formula this codebase invented,
+and is called out explicitly in `SCAFFOLDStrategy`'s docstring as a documented approximation, not
+a silent one.
+
+**BatchNorm-buffer risk (items 19/29): sidestepped by construction, not re-debugged.** Unlike
+`FedNovaStrategy`/`FedOptAdamStrategy`, the weights-aggregation line above (`x^{t+1}`) is a plain
+weighted average of the clients' returned `y_i` -- exactly `FedAvgWithAccuracyMetric`'s own
+convex combination, not an extrapolation -- so it inherits FedAvg's "can never leave the averaged
+values' range" safety automatically; no `buffer_mask` is needed for the weights themselves.
+`buffer_mask` here only pins BatchNorm buffer positions in `global_c`/`client_c` at zero forever
+(passed the same way `FedNovaStrategy` gets it, `bn_buffer_mask(net.state_dict().keys())`) --
+those arrays are never loaded into a model's `state_dict` or pushed through
+`sqrt(running_var + eps)`, so even though the control-variate *update* is itself an unclipped
+moving average, it has no path to the NaN failure mode items 19/29 found empirically.
+
+**`main.py`**: new `elif strat == 'SCAFFOLD':` branch (mirrors the `FedNova` branch immediately
+above it -- same `initial_parameters`/`buffer_mask` construction and `checkpoint_path` Track 2
+hook, new `client_fn_scaffold` closure using `FlowerClientScaffold`). Deliberately **not** added
+to the `strategy == 'all'` hardcoded list, same reasoning and same by-robot-only scope as item 29.
+
+**Risk / blast radius**: additive-only new strategy branch + one new client class (subclasses
+`FlowerClient`, changes only `fit()`) + one new training function (`train_scaffold`, does not
+modify `train()`). No existing strategy's code path, weighting, or output changes.
+
+**Smoke test**: `smoke_test/run_smoke_test.sh` step 5/10 (`--strategy SCAFFOLD`, 2 rounds/1 epoch
+against synthetic data), full 10-step suite. First attempt (job 33574485) failed at the shell
+level -- the worktree's `.venv` didn't exist (gitignored, needs the same symlink-to-main-worktree
+setup the `fedlgr_officedb-fednova` worktree used); fixed by symlinking it. Second attempt (job
+33575925) got through SCAFFOLD's own step cleanly (finite loss/PCC/RMSE both rounds, no NaN, no
+`train_scaffold` assertion failure -- confirms the state_dict-order-vs-`model.parameters()`-order
+assumption holds for MobileNetV2) but failed later at step 7 (FedRoot+LGR) with the exact
+"Expected more than 1 value per channel" BatchNorm-batch-of-1 crash item 30 fixes -- because this
+branch had forked from `officedb-adapt` *before* item 30 landed. Rebased onto item 30 (see status
+line above); job 33578145 then completed all 10 steps cleanly end to end.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

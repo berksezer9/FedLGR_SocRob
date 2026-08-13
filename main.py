@@ -6,11 +6,11 @@ import torch.nn as nn
 from datetime import datetime
 
 from server.strategies import FedAvgWithAccuracyMetric, FedProxWithAccuracyMetric, FedOptAdamStrategy, \
-    FedNovaStrategy, bn_buffer_mask
+    FedNovaStrategy, SCAFFOLDStrategy, bn_buffer_mask
 from server.utils import fit_config, evaluate_config
 
 from client.fedBN import FlowerClient_BN, FlowerClient_BN_Root
-from client.default import FlowerClient
+from client.default import FlowerClient, FlowerClientScaffold
 from client.fedRoot import FlowerClient_Root
 from dataloader.utils import *
 
@@ -143,6 +143,10 @@ def run(args):
     def client_fn(cid):
         return FlowerClient(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
                             y_labels=y_labels, num_clients=int(n_cl), DEVICE=DEVICE, path=path)
+
+    def client_fn_scaffold(cid):
+        return FlowerClientScaffold(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
+                                    y_labels=y_labels, num_clients=int(n_cl), DEVICE=DEVICE, path=path)
 
     def client_fn_root(cid):
         return FlowerClient_Root(cid, net.to(DEVICE), trainloaders[int(cid)], testloaders[int(cid)], epochs=int(args.epochs),
@@ -322,6 +326,31 @@ def run(args):
                                              checkpoint_path=f"{path}/global_params.pkl")
                 )
                 client_function = client_fn
+
+            elif strat == 'SCAFFOLD':
+                # SCAFFOLD (OFFICEDB_MODIFICATIONS.md item 31): corrects
+                # client drift via control variates, kept server-side in
+                # SCAFFOLDStrategy rather than persisted per-client -- see
+                # that class's docstring. buffer_mask here only protects the
+                # control-variate bookkeeping (pins BatchNorm buffer
+                # positions at zero in global_c/client_c); the weight
+                # aggregation itself is a plain FedAvg-safe weighted average,
+                # unlike FedNova/FedOptAdam's extrapolation, so it doesn't
+                # need buffer_mask for BatchNorm-NaN protection the way those
+                # two do (items 19/29). checkpoint_path: same Track 2
+                # federated domain-transfer hook FedNova's branch has, added
+                # opportunistically for the same reason (one-line reuse of an
+                # already-tested kwarg).
+                strategy = SCAFFOLDStrategy(
+                    min_available_clients=int(n_cl),
+                    initial_parameters=fl.common.ndarrays_to_parameters(get_parameters(net)),
+                    buffer_mask=bn_buffer_mask(net.state_dict().keys()),
+                    on_fit_config_fn=fit_config,
+                    on_evaluate_config_fn=evaluate_config,
+                    evaluate_fn=get_eval_fn(central_model, testloader=testloader, DEVICE=DEVICE, y_labels=y_labels,
+                                             checkpoint_path=f"{path}/global_params.pkl")
+                )
+                client_function = client_fn_scaffold
 
             elif strat == 'FedBN':
                 # params = get_parameters_bn(net)
