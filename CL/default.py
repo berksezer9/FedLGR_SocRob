@@ -907,6 +907,14 @@ class LatentGenerativeReplay(nn.Module):
 		new_pairs = []
 		net.eval()  # Set the model to evaluation mode
 		net.to(DEVICE)
+		# self.model.fc_module gets a batch of exactly 1 sample per iteration
+		# below (one torch.randn(1, 64) draw at a time) -- fine for BatchNorm
+		# in eval mode (uses running stats) but a guaranteed crash if fc_module
+		# is still in train mode from the caller's preceding training loop
+		# (item 30, OFFICEDB_MODIFICATIONS.md). Force eval for this inference-only
+		# pseudo-labeling pass and restore whatever mode it was in afterwards.
+		fc_was_training = self.model.fc_module.training
+		self.model.fc_module.eval()
 		with torch.no_grad():
 			for i in range(num_samples):
 				inputs = torch.randn(1, 64).to(DEVICE)
@@ -914,15 +922,19 @@ class LatentGenerativeReplay(nn.Module):
 				labels = self.model.fc_module(outputs)
 				for i in range(len(outputs)):
 					new_pairs.append((outputs[i], labels[i]))
+		self.model.fc_module.train(fc_was_training)
 		# batch_size = 16
 		new_data = CustomOutputDataset(new_pairs)
 		new_data_loader = DataLoader(new_data, batch_size=batch_size, shuffle=True, drop_last=True)
 		return new_data_loader
-	
+
 	def predict_from_gen_gen(self, net, num_samples, DEVICE, batch_size=16):
 		new_pairs = []
 		net.eval()  # Set the model to evaluation mode
 		net.to(DEVICE)
+		# Same batch-of-1-into-BatchNorm issue as predict_from_gen above (item 30).
+		fc_was_training = self.model.fc_module.training
+		self.model.fc_module.eval()
 		with torch.no_grad():
 			for i in range(num_samples):
 				inputs = torch.randn(1, 64).to(DEVICE)
@@ -930,6 +942,7 @@ class LatentGenerativeReplay(nn.Module):
 				labels = self.model.fc_module(outputs)
 				for i in range(len(outputs)):
 					new_pairs.append((outputs[i], outputs[i]))
+		self.model.fc_module.train(fc_was_training)
 		# batch_size = 16
 		new_data = CustomOutputDataset(new_pairs)
 		new_data_loader = DataLoader(new_data, batch_size=batch_size, shuffle=True, drop_last=True)

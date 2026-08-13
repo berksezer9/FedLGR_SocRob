@@ -1098,6 +1098,41 @@ hang risk -- job 33538472 completed cleanly on a different node and confirmed
 `global_params.pkl` is written and loads back as a 321-tensor state dict with no NaNs). See this
 item's companion smoke-test logs, not committed here -- ephemeral verification only.
 
+## 30. `CL/default.py` -- force eval mode on `fc_module` during LGR's generative pseudo-labeling
+
+**Status: implemented**, found already applied uncommitted in the shared vendor checkout at the
+start of this session (mtime 2026-08-12 21:17, predating this session) -- picked up mid-way
+through re-verifying item 28's LGR fix (both worktrees share this vendor checkout, not a
+per-worktree clone, so an uncommitted change here is visible/live everywhere at once).
+Committing and documenting it now per this file's own convention that every vendor change is
+catalogued, rather than leaving it as a stray uncommitted diff in a "don't touch" vendor repo.
+
+**Why**: `LatentGenerativeReplay.predict_from_gen`/`predict_from_gen_gen` (used to generate
+pseudo-labeled replay pairs from the VAE's latent space) call `self.model.fc_module` one
+`torch.randn(1, 64)` sample at a time inside a `torch.no_grad()` loop. If `fc_module` was left in
+`.train()` mode by the caller's preceding training phase, a batch size of exactly 1 crashes any
+`BatchNorm` layer in it (needs >1 sample per channel for a batch statistic) -- the same class of
+bug as item 28's `create_dataset`/`create_dataset_gen` DataLoaders, just hit via inference-time
+batch-of-1 calls instead of a drop_last remainder batch.
+
+**Fix**: both methods now save `fc_module`'s incoming training-mode flag, force `.eval()` before
+the sampling loop (correct anyway for a no_grad, inference-only pseudo-labeling pass -- `eval()`
+makes BatchNorm use its running stats instead of computing a batch statistic, sidestepping the
+batch-of-1 problem entirely), and restore the original mode afterward so the caller's own
+training-mode bookkeeping is undisturbed.
+
+**Verification**: no dedicated isolated smoke test was run for this fix specifically (unlike item
+28's `smoke_fcl_lgr_icelake.sbatch`). It was already live in the code for both the item-28
+re-verification smoke test (job 33571492, `COMPLETED` clean, both task boundaries exercised) and
+the real-scope `FedRoot`x`LGR` chain (33573281-33573283) this session submitted -- i.e. confirmed
+compatible with a full clean LGR run, not confirmed in isolation as fixing a reproduced crash the
+way item 28 was.
+
+**Risk / blast radius**: touches only `LatentGenerativeReplay.predict_from_gen`/
+`predict_from_gen_gen`, both `LGR`-only code (dead for every other CL strategy). Restores
+`fc_module`'s prior mode on exit, so no behavior change for callers relying on it staying in
+`.train()`/`.eval()` after these methods return.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB
