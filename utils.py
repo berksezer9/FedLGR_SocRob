@@ -172,6 +172,65 @@ def train(model, train_loader, epochs, DEVICE):
 	return peak_ramu
 
 
+def train_scaffold(model, train_loader, epochs, DEVICE, correction):
+	"""Local Adam training with SCAFFOLD's (Karimireddy et al., ICML 2020,
+	https://arxiv.org/abs/1910.06378) control-variate gradient correction
+	added after backward() and before optimizer.step(). `correction` is
+	`global_c - client_c` for this client this round, computed and owned
+	server-side (server/strategies.py's SCAFFOLDStrategy -- see its
+	docstring for why control-variate state lives there rather than being
+	persisted per-client). `correction` is the same length/order as
+	model.state_dict(); BatchNorm running_mean/running_var/num_batches_tracked
+	positions are always zero there (a buffer has no .grad at all, so a
+	correction wouldn't mean anything for it) and are skipped below rather
+	than applied. See OFFICEDB_MODIFICATIONS.md item 31.
+	"""
+	ramu = RAMU()
+	peak_ramu = 0
+	peak_ramu = max(peak_ramu, ramu.compute("TRAINING"))
+	criterion = nn.MSELoss()
+	optimizer = optim.Adam(model.parameters(), lr=0.001)
+	model.to(DEVICE)
+	model.train()
+
+	# Same buffer tags server/strategies.py's bn_buffer_mask matches on --
+	# not imported from there to avoid a client/utils -> server import (this
+	# module is imported by both sides).
+	buffer_tags = ("running_mean", "running_var", "num_batches_tracked")
+	is_buffer = [any(tag in k for tag in buffer_tags) for k in model.state_dict().keys()]
+	correction_tensors = [
+		torch.tensor(c, device=DEVICE, dtype=torch.float32)
+		for c, buf in zip(correction, is_buffer) if not buf
+	]
+	trainable_params = list(model.parameters())
+	assert len(correction_tensors) == len(trainable_params), (
+		"SCAFFOLD correction/parameter count mismatch: "
+		f"{len(correction_tensors)} non-buffer correction entries vs. "
+		f"{len(trainable_params)} model.parameters() -- state_dict()'s "
+		"non-buffer subsequence is assumed to align with model.parameters() "
+		"order (see train_scaffold's docstring); that assumption broke for "
+		"this model."
+	)
+
+	for epoch in range(epochs):
+		running_loss = 0.0
+		for images, labels in train_loader:
+			images, labels = images.to(DEVICE), labels.to(DEVICE)
+			optimizer.zero_grad()
+			outputs = model(images)
+			loss = criterion(outputs, labels)
+			loss.backward()
+			with torch.no_grad():
+				for p, corr in zip(trainable_params, correction_tensors):
+					if p.grad is not None:
+						p.grad.add_(corr)
+			optimizer.step()
+			running_loss += loss.item()
+			peak_ramu = max(peak_ramu, ramu.compute("TRAINING"))
+		print(f"Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+	return peak_ramu
+
+
 def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels, max_epochs=40, patience=5):
 	# Val-loss-based early stopping + best-checkpoint selection
 	# (OFFICEDB_MODIFICATIONS.md item 25), added because the domain-transfer

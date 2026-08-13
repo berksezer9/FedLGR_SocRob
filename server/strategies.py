@@ -4,6 +4,7 @@ import numpy as np
 import flwr as fl
 from flwr.common import (
 	EvaluateRes,
+	FitIns,
 	FitRes,
 	Parameters,
 	Scalar,
@@ -194,6 +195,165 @@ class FedNovaStrategy(fl.server.strategy.FedAvg):
 			else:
 				new_weights.append(x - tau_effective * agg)
 
+		self.current_weights = new_weights
+
+		metrics_aggregated = {}
+		if self.fit_metrics_aggregation_fn:
+			fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
+			metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
+		return ndarrays_to_parameters(new_weights), metrics_aggregated
+
+	def aggregate_evaluate(
+		self,
+		rnd: int,
+		results: List[Tuple[ClientProxy, EvaluateRes]],
+		failures: List[BaseException],
+	) -> Tuple[Optional[float], Dict[str, Scalar]]:
+		"""Aggregate evaluation losses using weighted average."""
+		_require_results(results, failures, "evaluate", rnd)
+		if not self.accept_failures and failures:
+			return None, {}
+		loss_aggregated = weighted_avg([(evaluate_res.num_examples, evaluate_res.loss) for _, evaluate_res in results])
+		pcc_aggregated = weighted_avg(
+			[(evaluate_res.num_examples, evaluate_res.metrics['avg_pearson_score']) for _, evaluate_res in results])
+		rmse = weighted_avg(
+			[(evaluate_res.num_examples, evaluate_res.metrics['avg_rmse']) for _, evaluate_res in results])
+
+		return loss_aggregated, {'avg_pearson_score': pcc_aggregated, 'avg_rmse': rmse}
+
+
+class SCAFFOLDStrategy(fl.server.strategy.FedAvg):
+	"""SCAFFOLD (Karimireddy et al., ICML 2020, https://arxiv.org/abs/1910.06378):
+	corrects client drift under non-IID data via control variates that pull
+	each client's local gradients back toward the global direction. See
+	OFFICEDB_MODIFICATIONS.md item 31.
+
+	The paper's canonical form threads a per-client control variate c_i
+	through the client, requiring it to be persisted across rounds --
+	awkward here since `fl.simulation.start_simulation`'s Ray VirtualClientEngine
+	re-instantiates the FlowerClient object every round (the CL clients
+	already work around exactly this via disk pickles, e.g.
+	client/default.py's reg{cid}.pkl). SCAFFOLD's arithmetic doesn't actually
+	require that: every quantity in the client_i control-variate update
+	(Option II: c_i^+ = c_i - c + (x^t - y_i)/(tau_i * local_lr)) is either
+	already known server-side (x^t, c, tau_i via the fit-metrics `local_steps`
+	key FedNovaStrategy also uses) or is exactly what the client returns
+	anyway (y_i). So this implementation keeps ALL control-variate state in
+	the (single long-lived process, unlike the Ray client actors) Strategy
+	object instead: `self.global_c` (server control variate) and
+	`self.client_c` (per-client control variate, keyed by ClientProxy.cid,
+	implicitly zero for a client not yet seen). `configure_fit` sends each
+	client its personal correction term `global_c - client_c[cid]`
+	concatenated after the current model weights (doubling the outgoing
+	payload only, not the returned one); the client (client/default.py's
+	FlowerClientScaffold) just adds that correction to its local gradients
+	each step (utils.py's train_scaffold) and returns plain trained weights
+	plus `local_steps` -- exactly FedNovaStrategy's client-side contract,
+	nothing new to persist client-side.
+
+	BatchNorm-buffer risk (items 19/29): deliberately sidestepped rather than
+	re-debugged. The model-weights aggregation half of this strategy
+	(`aggregate_fit` below) is a **plain weighted average of the clients'
+	returned y_i** -- identical in shape to FedAvg's own convex combination,
+	not FedNova's/FedOptAdam's extrapolation -- so it inherits FedAvg's
+	"can never leave the averaged values' range" safety automatically, no
+	buffer_mask needed for the weights themselves. `buffer_mask` is only used
+	to pin BatchNorm buffer positions in `global_c`/`client_c` at zero
+	forever (those aren't gradient-trained parameters -- no `.grad` exists
+	for a buffer -- so a control-variate correction there would be
+	meaningless, not just risky); those arrays never get loaded into a
+	model's state_dict or pushed through BatchNorm's `sqrt(running_var + eps)`
+	forward-pass math, so even though the control-variate *update* is
+	itself an unclipped moving average (not a convex combination), it has no
+	path to the NaN failure mode items 19/29 found.
+	"""
+
+	def __init__(self, *args, buffer_mask: Optional[List[bool]] = None, local_lr: float = 0.001, **kwargs):
+		if kwargs.get("initial_parameters") is None:
+			raise ValueError(
+				"SCAFFOLDStrategy requires initial_parameters -- it needs the "
+				"pre-round global weights (self.current_weights) and a known "
+				"shape/length to initialize global_c/client_c against, same "
+				"reason FedNovaStrategy/FedOptAdamStrategy do."
+			)
+		super().__init__(*args, **kwargs)
+		init = parameters_to_ndarrays(kwargs["initial_parameters"])
+		self.current_weights = init
+		self.buffer_mask = buffer_mask if buffer_mask is not None else [False] * len(init)
+		self.global_c = [np.zeros_like(x) for x in init]
+		self.client_c: Dict[str, List[np.ndarray]] = {}
+		# Must match utils.train_scaffold's optimizer lr (Adam) -- SCAFFOLD's
+		# Option II update is derived for SGD's effective step size; using
+		# Adam's nominal lr here is the standard practical approximation (the
+		# paper's convergence theory doesn't cover Adam either way), not a
+		# formula this codebase invented.
+		self.local_lr = local_lr
+
+	def _zeros_c(self) -> List[np.ndarray]:
+		return [np.zeros_like(x) for x in self.global_c]
+
+	def configure_fit(
+		self,
+		server_round: int,
+		parameters: Parameters,
+		client_manager: Any,
+	) -> List[Tuple[ClientProxy, FitIns]]:
+		client_fit_pairs = super().configure_fit(server_round, parameters, client_manager)
+		weights = parameters_to_ndarrays(parameters)
+		out = []
+		for client, fit_ins in client_fit_pairs:
+			c_i = self.client_c.get(client.cid, self._zeros_c())
+			correction = [g - c for g, c in zip(self.global_c, c_i)]
+			combined = ndarrays_to_parameters(weights + correction)
+			out.append((client, FitIns(combined, fit_ins.config)))
+		return out
+
+	def aggregate_fit(
+		self,
+		server_round: int,
+		results: List[Tuple[ClientProxy, FitRes]],
+		failures: List[Any],
+	) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+		_require_results(results, failures, "fit", server_round)
+		if not self.accept_failures and failures:
+			return None, {}
+
+		total_examples = sum(fit_res.num_examples for _, fit_res in results)
+		n = len(self.current_weights)
+		new_weights = [np.zeros_like(x) for x in self.current_weights]
+		c_delta_sum = self._zeros_c()
+
+		for client, fit_res in results:
+			tau_i = fit_res.metrics.get("local_steps")
+			if not tau_i:
+				raise RoundFailedError(
+					f"fit round {server_round}: a client returned no (or zero) "
+					"'local_steps' fit-metric -- SCAFFOLDStrategy requires it "
+					"to compute that client's control-variate update (same "
+					"requirement FedNovaStrategy has). See "
+					"OFFICEDB_MODIFICATIONS.md item 31."
+				)
+			y_i = parameters_to_ndarrays(fit_res.parameters)
+			p_i = fit_res.num_examples / total_examples
+			for j in range(n):
+				new_weights[j] = new_weights[j] + p_i * y_i[j]
+
+			c_i_old = self.client_c.get(client.cid, self._zeros_c())
+			c_i_new = []
+			for j in range(n):
+				if self.buffer_mask[j]:
+					c_i_new.append(c_i_old[j])
+				else:
+					c_i_new.append(
+						c_i_old[j] - self.global_c[j]
+						+ (self.current_weights[j] - y_i[j]) / (tau_i * self.local_lr)
+					)
+			self.client_c[client.cid] = c_i_new
+			for j in range(n):
+				c_delta_sum[j] = c_delta_sum[j] + (c_i_new[j] - c_i_old[j])
+
+		num_sampled = len(results)
+		self.global_c = [c + delta / num_sampled for c, delta in zip(self.global_c, c_delta_sum)]
 		self.current_weights = new_weights
 
 		metrics_aggregated = {}
