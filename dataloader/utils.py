@@ -187,6 +187,13 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 		outputs = pd.DataFrame(predict_gen_distil(teacher_model, train_loader_distil, DEVICE))
 		trainset = CustomDataset(dataframe=pd.concat([data_images_train.iloc[:len(outputs), :label_start], outputs], axis=1, ignore_index=True),
 		                        transform=train_transform, label_start=label_start)
+		# train_loader_distil used drop_last=True, so outputs (and the trainset
+		# just rebuilt above) can be up to batch_size-1 rows shorter than
+		# data_images_train. Truncate data_images_train to match -- otherwise
+		# the group_col Subset-index lookup below uses row labels from the
+		# untruncated frame against the now-shorter trainset and can index
+		# past its end (OFFICEDB_MODIFICATIONS.md item 32).
+		data_images_train = data_images_train.iloc[:len(outputs)].reset_index(drop=True)
 
 
 	if group_col is not None and group_col in data_images_train.columns:

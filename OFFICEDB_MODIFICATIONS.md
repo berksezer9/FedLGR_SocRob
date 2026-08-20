@@ -1226,6 +1226,61 @@ assumption holds for MobileNetV2) but failed later at step 7 (FedRoot+LGR) with 
 branch had forked from `officedb-adapt` *before* item 30 landed. Rebased onto item 30 (see status
 line above); job 33578145 then completed all 10 steps cleanly end to end.
 
+## 32. `dataloader/utils.py` -- FedDistill/FedRoot-FedDistill `IndexError` under by-robot/by-room partitioning
+
+Diagnosed 2026-08-20 from the protocol-C by-robot sweep's 12 failures (all FedDistill or
+FedRoot-FedDistill, seed-clustered -- `docs/fedlgr_officedb_experiments.md`'s "Protocol C hybrid
+sweep" and "Supervisor-finalized protocol" sections). Retained job logs (`logs/fl_strategy_
+{33875088,...}.log`, contrary to an earlier assumption that they weren't kept) show every
+failure is `RoundFailedError: fit round 1: 0/3 clients returned a result`, and each client's
+underlying exception is `IndexError: index 22499 is out of bounds for axis 0 with size 22496`
+(or similar, always off by 1-3) raised inside `imageloader.py:__getitem__` via a
+`torch.utils.data.Subset`.
+
+**Root cause**: when `distil=True` (i.e. `strategy=FedDistill` or `base=FedDistill`),
+`load_datasets(...)` rebuilds `trainset` from the teacher model's soft-label predictions
+(`predict_gen_distil`, called on `train_loader_distil`, which uses `drop_last=True`). Any
+trailing partial batch (0 to `batch_size-1` = up to 15 rows) is silently dropped from `outputs`,
+so the rebuilt `trainset` can be shorter than `data_images_train`. The `group_col` (by-robot/
+by-room) partitioning code immediately below, however, still read `data_images_train.index[...]`
+-- the *original, untruncated* frame's row labels -- to build each client's
+`torch.utils.data.Subset(trainset, ...)`. Whenever one of the dropped trailing rows happened to
+belong to a given robot/room group (seed-dependent, since the row order comes from an unseeded
+`.sample(frac=1)` shuffle upstream), that client's `Subset` contained a row label past the end of
+the now-shorter `trainset`, crashing at first `DataLoader` access -- explaining both why only
+FedDistill/FedRoot-FedDistill hit it (every other strategy skips the `distil` branch entirely and
+never shortens `trainset`) and why it was seed-clustered (whether the dropped rows land in a
+given group is a matter of that run's row-shuffle luck, not deterministic per strategy).
+Predates this fork -- item 16 (2026-07-31) added the `group_col`-based train/test partitioning
+that this interacts with, and item 15 (also 2026-07-31) already touched `predict_gen_distil` for
+an unrelated column-count bug -- but neither investigation exercised group_col partitioning and
+FedDistill together at enough scale to surface this; the 12x volume of the protocol-C crossed
+sweep (vs. earlier single/few-seed FedDistill runs) is what finally hit it reliably.
+
+**Fix**: after the `distil` branch rebuilds `trainset` from `outputs`, `data_images_train` is now
+also truncated to `data_images_train.iloc[:len(outputs)].reset_index(drop=True)` -- matching
+`trainset`'s actual length and re-establishing 0-based row-label alignment before the
+`group_col` Subset-index lookup runs. Scoped to the `distil=True` branch only; every other
+strategy's `data_images_train` (and therefore its group_col partitioning) is untouched.
+`predict_gen_distil` itself and `train_loader_distil`'s `drop_last=True` were deliberately left
+alone -- `predict_gen_distil`'s `numpy.asarray(outputs).reshape((len(trainloader) * batch_size,
+num_classes))` assumes every batch is exactly `batch_size` rows, so flipping `drop_last` there
+would need a second, unrelated fix (`numpy.concatenate` instead of `asarray`+`reshape`) for no
+benefit -- truncating `data_images_train` to match is the minimal, self-contained fix.
+
+**Risk / blast radius**: one added line inside the `distil=True` branch of
+`load_datasets(...)`. Does not change `predict_gen_distil`, the teacher-model training, the
+distillation soft-labels themselves, or any non-`distil` strategy's data path. Training-set size
+for FedDistill/FedRoot-FedDistill runs shrinks by at most `batch_size-1` (16, i.e. <0.1% of
+OfficeDB's ~22.5k augmented per-partition row count) rows relative to what a bug-free run would
+have used -- the same rows `predict_gen_distil` was already silently excluding from distillation
+supervision, just now also consistently excluded from `trainset`/group partitioning instead of
+half-included and then crashing.
+
+**Verification**: not yet smoke-tested against a real fold/seed as of this entry -- next step is
+a targeted repro of one previously-failing combo (e.g. `FedDistill k4_test0 seed0`, job 33875088)
+before resubmitting the FedDistill family at 5-fold.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB
