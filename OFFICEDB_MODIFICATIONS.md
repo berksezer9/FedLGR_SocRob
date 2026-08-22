@@ -1281,6 +1281,66 @@ half-included and then crashing.
 a targeted repro of one previously-failing combo (e.g. `FedDistill k4_test0 seed0`, job 33875088)
 before resubmitting the FedDistill family at 5-fold.
 
+## 33. `utils.py`, `client/default.py`, `client/fedBN.py`, `client/fedRoot.py`, `transfer_eval.py` -- `test()` now returns raw predictions; FL-sweep evaluate() persists them for CCC/CwM
+
+Raised by the user 2026-08-22 after asking why CCC/CwM (`eval/metrics.py`, beyond the RMSE/PCC
+this project's FL sweep reports) were unavailable for the by-robot 5-fold sweep results. Checked
+`utils.py`'s `test()` directly (not just `fedlgr_officedb/evaluate.py`'s docstring note): it
+already builds the full `all_labels`/`all_outputs` tensors internally to compute loss/RMSE/
+Pearson, then discards them -- only 3 scalars (`loss, avg_pearson, avg_rmse`) were ever returned,
+and none of `test()`'s 14 call sites across the codebase (FL clients, FCL clients, centralized
+eval, `pretrain.py`'s val-loss early stopping, `transfer_eval.py`'s domain-transfer eval)
+persisted them either. CCC and CwM both need raw per-scene (y_true, y_pred) pairs and cannot be
+derived from any of the aggregate CSVs already on disk (`*_decentral.csv`, `comp_extracted.csv`,
+`clientwise/results{cid}.txt`) or from the model-weight checkpoints
+(`global_params.pkl`/`mod{cid}.pkl`/`mod_bn{cid}.pkl` -- confirmed these are `state_dict` pickles
+via their `pickle.dump(state_dict, f)` call sites, not predictions).
+
+**Checkpoint-availability finding that shaped the fix's scope**: only 4/10 strategies in the
+already-completed by-robot k5 sweep have final-round weights saved at all (FedAvg/FedNova/
+SCAFFOLD via `global_params.pkl`, FedRoot-FedAvg via `global_params.pkl` trunk + `mod{cid}.pkl`
+head) -- `main.py`'s FedProx/FedOptAdam/FedBN branches, and FedRoot's FedBN/FedOptAdam/FedProx
+base branches, never pass a `checkpoint_path` into their `evaluate_fn`/strategy construction. So
+backfilling CCC/CwM for those other 6 strategies' already-completed runs needs a full retrain
+regardless of this fix -- this fix only prevents the gap from recurring, it doesn't retroactively
+fix already-written result files (same caveat as item 21's fix).
+
+**Fix -- two parts**:
+1. `test()` (`utils.py`) now returns a 5-tuple: `loss, avg_pearson, rmse, labels_np, outputs_np`
+   (previously 3). All 14 call sites updated to match (12 just unpack-and-discard the two new
+   values with `_, _` -- pretrain's val loop, `get_eval_fn`/`get_eval_fn_cl`/`get_eval_fn_bn`'s
+   centralized eval, both FCL client `evaluate()` methods in `default.py`/`fedRoot.py`, and all 3
+   `transfer_eval.py` call sites -- their behavior is otherwise unchanged).
+2. The 4 FL-sweep decentralized (per-client) `evaluate()` methods that actually matter for
+   `decentral.csv` (this project's reported metric source, not `central.csv`) now persist the raw
+   pairs: `client/default.py`'s `FlowerClient.evaluate()` (FedAvg/FedProx/FedOptAdam/FedNova/
+   SCAFFOLD/FedDistill), `client/fedBN.py`'s `FlowerClient_BN.evaluate()` (FedBN) and
+   `FlowerClient_BN_Root.evaluate()` (FedRoot-FedBN), `client/fedRoot.py`'s
+   `FlowerClient_Root.evaluate()` (FedRoot-FedAvg/FedProx/FedOptAdam/FedDistill). Each writes
+   `clientwise/preds{cid}_round{server_round}.npz` (`y_true`, `y_pred`, `y_labels` arrays) next to
+   the existing `clientwise/results{cid}.txt` scalar log, every round (not just the final one --
+   cheap: ~142.5 KB/round for all clients combined on OfficeDB's by-robot partition, measured).
+   Centralized eval (`get_eval_fn`/`get_eval_fn_bn`) deliberately does **not** persist raw
+   predictions -- `central.csv` isn't this project's reported metric source, and wiring
+   `checkpoint_path`-style output paths through `get_eval_fn`'s FedProx/FedOptAdam call sites
+   (which don't currently take one) was judged out of scope for this fix.
+
+**Incidental hardening, same touched lines**: `os.makedirs(f'{self.path}/clientwise')` in all 4
+persisting `evaluate()` methods (and their matching `fit()` methods) changed from
+`if not os.path.exists(...): os.makedirs(...)` to `os.makedirs(..., exist_ok=True)` -- fixes a
+real race (3 Ray actors can call this concurrently) caught during the by-robot k5 sweep's backup
+health-check: job 34058073 (SCAFFOLD, k5_test4/seed1) hit `FileExistsError` here and lost one
+client's round-1 fit (`aggregate_fit: received 2 results and 1 failures`, recovered rounds 2-5;
+see `docs/fedlgr_officedb_fl_hybrid_sweep_by-robot_k5_results.md` §6). Flagged, not fixed, at
+backup time; fixed now since these exact lines were already being edited. **Not** applied to the
+FCL classes' equivalent `os.makedirs` calls in `default.py`/`fedRoot.py` (`FlowerClientCL`,
+`FlowerClient_NR`, `FlowerClientCL_Root`, `FlowerClient_NR_Root`, `FlowerClient_LGR`) -- out of
+scope for this FL-sweep-focused fix, left as a flagged-not-fixed note for whoever next touches
+the FCL client classes.
+
+**Verification**: not yet smoke-tested against real data as of this entry -- see
+`smoke_test/run_smoke_test.sh` before trusting this against a real sweep.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

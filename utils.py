@@ -272,7 +272,7 @@ def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels,
 			running_loss += loss.item()
 		train_loss = running_loss / len(train_loader)
 
-		val_loss, val_pcc, val_rmse = test(net=model, testloader=val_loader, y_labels=y_labels, DEVICE=DEVICE)
+		val_loss, val_pcc, val_rmse, _, _ = test(net=model, testloader=val_loader, y_labels=y_labels, DEVICE=DEVICE)
 		is_best = val_loss < best_val_loss
 		print(f"Epoch {epoch + 1}/{max_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}"
 			  f"{' (best)' if is_best else ''}")
@@ -379,7 +379,15 @@ def test(net, testloader, y_labels, DEVICE, active_idx=None):
 		if math.isnan(temp):
 			temp = pearsonr(labels_np[:, i], np.random.normal(outputs_np[:, i], 0.0000001))[0]
 		pearson[y_labels[i]] = temp
-	return loss, Average(list(pearson.values())), rmse
+	# labels_np/outputs_np (OFFICEDB_MODIFICATIONS.md item 33): the raw per-scene
+	# (y_true, y_pred) pairs test() already builds to compute the three scalars
+	# above, now returned instead of discarded -- CCC/CwM (eval/metrics.py) need
+	# them and previously had no way to get them without retraining. Every caller
+	# updated to match this 5-tuple; only the FL sweep's decentralized (per-client)
+	# evaluate() methods actually persist them to disk (see those files) -- other
+	# callers (pretrain/domain-transfer validation, FCL, centralized eval) just
+	# receive and discard, unchanged behavior otherwise.
+	return loss, Average(list(pearson.values())), rmse, labels_np, outputs_np
 
 
 # return loss, pcc, rmse
@@ -460,7 +468,11 @@ def get_eval_fn(net, testloader, y_labels, DEVICE, checkpoint_path=None):
 		net.load_state_dict(state_dict, strict=True)
 		if checkpoint_path is not None:
 			_dump_global_params(net, checkpoint_path)
-		loss, avg_pearson, avg_rmse = test(net, testloader, y_labels, DEVICE)
+		# Centralized eval (unlike the per-client decentralized evaluate() methods)
+		# does not persist raw predictions -- decentral.csv (from the federated
+		# evaluate() calls) is this project's reported source of truth, not
+		# central.csv (OFFICEDB_MODIFICATIONS.md item 33).
+		loss, avg_pearson, avg_rmse, _, _ = test(net, testloader, y_labels, DEVICE)
 		print("Round %s, Loss %s, Pearson %s, RMSE %s" % (server_round, loss, avg_pearson, avg_rmse))
 		return loss, {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
 
@@ -526,7 +538,7 @@ def get_eval_fn_cl(net, testloader, y_labels, DEVICE, rounds_per_task=5, n_tasks
 		else:
 			active_idx = None
 			task_y_labels = y_labels
-		loss, avg_pearson, avg_rmse = test(net, testloader[task_idx], task_y_labels, DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _ = test(net, testloader[task_idx], task_y_labels, DEVICE, active_idx=active_idx)
 
 		print("Round %s, Loss %s, Pearson %s, RMSE %s" % (server_round, loss, avg_pearson, avg_rmse))
 		return loss, {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
@@ -544,9 +556,9 @@ def get_eval_fn_bn(net, testloader, y_labels, DEVICE):
 		state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
 		net.load_state_dict(state_dict, strict=False)
 		
-		loss, avg_pearson, avg_rmse = test(net, testloader, y_labels, DEVICE)
+		loss, avg_pearson, avg_rmse, _, _ = test(net, testloader, y_labels, DEVICE)
 		return loss, {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
-	
+
 	return evaluate
 
 

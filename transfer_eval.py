@@ -58,7 +58,7 @@ def run(args):
         DEVICE=DEVICE, action_cols=action_cols, extra_cols=extra_cols, split_col='Split')
 
     results = {}
-    loss, pcc, rmse = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
+    loss, pcc, rmse, _, _ = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
     print("Zero-shot:", loss, pcc, rmse)
     results['zero_shot'] = {'loss': loss, 'pcc': pcc, 'rmse': rmse}
 
@@ -76,12 +76,12 @@ def run(args):
         best_epoch, best_val_loss = train_with_early_stopping(
             model=model, train_loader=trainloaders[0], val_loader=val_loader, DEVICE=DEVICE,
             y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience)
-        loss, pcc, rmse = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
+        loss, pcc, rmse, _, _ = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
         print(f"Fine-tuned (early-stopped at epoch {best_epoch}, val loss {best_val_loss}):", loss, pcc, rmse)
         results['finetuned'] = {'epochs': best_epoch, 'val_loss': best_val_loss, 'loss': loss, 'pcc': pcc, 'rmse': rmse}
     elif args.finetune_epochs > 0:
         train(model=model, train_loader=trainloaders[0], epochs=args.finetune_epochs, DEVICE=DEVICE)
-        loss, pcc, rmse = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
+        loss, pcc, rmse, _, _ = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
         print(f"Fine-tuned ({args.finetune_epochs} epochs):", loss, pcc, rmse)
         results['finetuned'] = {'epochs': args.finetune_epochs, 'loss': loss, 'pcc': pcc, 'rmse': rmse}
 

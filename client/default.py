@@ -48,8 +48,11 @@ class FlowerClient(fl.client.NumPyClient):
 		init_ram = ramu.compute("TRAINING")
 		peak_ram = train(self.net, self.trainloader, epochs=self.epochs, DEVICE=self.DEVICE)
 		# write it in a file
-		if not os.path.exists(f'{self.path}/clientwise'):
-			os.makedirs(f'{self.path}/clientwise')
+		# exist_ok=True (OFFICEDB_MODIFICATIONS.md item 33): 3 Ray actors racing
+		# to create the same directory intermittently hit FileExistsError under
+		# the plain exists-then-makedirs check (observed job 34058073, SCAFFOLD
+		# k5_test4/seed1 -- lost 1 client's round-1 fit to this).
+		os.makedirs(f'{self.path}/clientwise', exist_ok=True)
 		with open(f'{self.path}/clientwise/ramu{int(self.cid)}.csv', 'a+') as f:
 			f.write(f'{config["server_round"]},{init_ram},{peak_ram},{peak_ram - init_ram}\n')
 		# local_steps: total local SGD steps this round (epochs * batches) --
@@ -64,12 +67,16 @@ class FlowerClient(fl.client.NumPyClient):
 		return self.get_parameters(config={}), len(self.trainloader), {"local_steps": local_steps}
 	
 	def evaluate(self, parameters, config):
-		if not os.path.exists(f'{self.path}/clientwise'):
-			os.makedirs(f'{self.path}/clientwise')
+		os.makedirs(f'{self.path}/clientwise', exist_ok=True)
 		self.set_parameters(parameters)
-		loss, avg_pearson, avg_rmse = test(self.net, self.testloader, self.y_labels, DEVICE=self.DEVICE)
+		loss, avg_pearson, avg_rmse, y_true, y_pred = test(self.net, self.testloader, self.y_labels, DEVICE=self.DEVICE)
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
+		# preds{cid}_round{r}.npz (OFFICEDB_MODIFICATIONS.md item 33): raw
+		# per-scene (y_true, y_pred) pairs for this client/round, so CCC/CwM
+		# (eval/metrics.py) can be computed later without retraining.
+		np.savez(f'{self.path}/clientwise/preds{int(self.cid)}_round{config["server_round"]}.npz',
+				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels))
 		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
 
 
@@ -219,7 +226,7 @@ class FlowerClientCL(fl.client.NumPyClient):
 			y_labels = [self.y_labels[i] for i in active_idx]
 		else:
 			active_idx, y_labels = None, self.y_labels
-		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
@@ -338,7 +345,7 @@ class FlowerClient_NR(fl.client.NumPyClient):
 			y_labels = [self.y_labels[i] for i in active_idx]
 		else:
 			active_idx, y_labels = None, self.y_labels
-		loss, avg_pearson, avg_rmse = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
