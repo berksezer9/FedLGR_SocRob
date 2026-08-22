@@ -97,7 +97,7 @@ def run(args):
             print(f"Early-stopped at epoch {best_epoch} (val loss {best_val_loss})")
         else:
             train(model=model, train_loader=train_loader, epochs=args.epochs, DEVICE=DEVICE)
-        a,b,c=test(net=model, testloader=eval_loader,y_labels=y_labels, DEVICE=DEVICE)
+        a,b,c,_,_=test(net=model, testloader=eval_loader,y_labels=y_labels, DEVICE=DEVICE)
         print(a, b, c)
         with open(args.path + "/" + model_n + ".pkl", 'wb') as f:
             pickle.dump(model.state_dict(), f)
