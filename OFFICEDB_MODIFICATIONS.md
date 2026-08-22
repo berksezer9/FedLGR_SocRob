@@ -1341,6 +1341,49 @@ the FCL client classes.
 **Verification**: not yet smoke-tested against real data as of this entry -- see
 `smoke_test/run_smoke_test.sh` before trusting this against a real sweep.
 
+## 34. `utils.py`, `client/default.py`, `client/fedBN.py`, `client/fedRoot.py` -- `test()` now also computes/returns CCC directly (CwM stays post-hoc)
+
+Follow-up to item 33, same session (2026-08-22), user asked for `test()` to return "all major
+metrics, not only RMSE and PCC" alongside the raw predictions. Of this benchmark's 4 reported
+metrics (`eval/metrics.py`: RMSE, PCC, CCC, CwM), CCC needs only the (y_true, y_pred) pairs
+`test()` already builds -- no reason to defer it to a post-hoc script when it's this cheap to
+compute in the same place PCC already is. CwM is different: it needs raw *per-annotator* ratings
+(`eval/metrics.py`'s `cwm()` takes `human_ratings_per_scene`, a list of individual scores per
+scene, not the single aggregated label `test()` receives) -- and `dataloader/utils.py`'s
+`load_universal` already averages across annotators per stamp *before* `test()` ever sees a
+batch (item 3 above). Getting raw per-annotator ratings into `test()` would mean threading them
+through the Dataset/DataLoader layer, a materially bigger change than "fix `test()`" and out of
+scope here. CwM remains a post-hoc computation, joined from the raw data files against the
+`preds{cid}_round{r}.npz` files item 33 already persists -- unchanged from the item 33 plan.
+
+**Fix**: added `_ccc()` (`utils.py`, right before `test()`) -- Lin's CCC, a self-contained
+duplicate of `eval/metrics.py`'s `ccc()` (same formula), not an import: `eval/` lives in the main
+repo, and this vendor repo must stay runnable/licensed standalone (root `CLAUDE.md`'s "no shared
+code between pipelines" rule -- the two pipelines don't call into each other, so this is a
+deliberate duplication, not an oversight). Keep the two formulas in sync if either changes.
+`test()`'s return signature grew to a 6-tuple: `loss, avg_pearson, rmse, avg_ccc, labels_np,
+outputs_np` (avg_ccc computed the same way avg_pearson already is -- per output/action column,
+then averaged). All 17 call sites updated to match (13 just add one more `_` to discard it,
+unchanged behavior; the same 4 FL-sweep decentralized `evaluate()` methods item 33 touched --
+`FlowerClient`, `FlowerClient_BN`, `FlowerClient_BN_Root`, `FlowerClient_Root` -- now also append
+`avg_ccc` as a 5th column to `clientwise/results{cid}.txt` (was `round,loss,avg_pearson,avg_rmse`,
+now `round,loss,avg_pearson,avg_rmse,avg_ccc`) and add `"avg_ccc"` to the metrics dict returned to
+Flower. Purely additive to the file format -- confirmed
+`fedlgr_officedb/extract_federated_indomain_perrobot.py`'s `last_round()` parser only indexes
+`last[0..3]` via `.split(",")`, so it's unaffected by the new trailing column on both old
+(4-column) and new (5-column) `results{cid}.txt` files.
+
+**Not changed**: centralized eval (`get_eval_fn`/`get_eval_fn_cl`/`get_eval_fn_bn`), the FCL
+client `evaluate()` methods (`FlowerClientCL`, `FlowerClient_NR`, `FlowerClientCL_Root`,
+`FlowerClient_NR_Root`, `FlowerClient_LGR`), `pretrain.py`'s val loop, and `transfer_eval.py`'s 3
+call sites all just discard `avg_ccc` (extra `_`), matching item 33's own scoping of the raw-array
+persistence to only the 4 FL-sweep classes -- `decentral.csv` is this project's reported metric
+source, not `central.csv`, and FCL/transfer-eval logging formats were left alone.
+
+**Verification**: not yet smoke-tested -- covered by the same pending `smoke_test/run_smoke_test.sh`
+run as item 33 (step 11 already validates `preds*.npz` keys/shapes; results.txt's new 5th column
+isn't separately asserted by the smoke test, worth a quick manual check on the first real run).
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

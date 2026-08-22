@@ -82,14 +82,15 @@ class FlowerClient_BN(fl.client.NumPyClient):
 			with open(f'{self.path}/mod_bn{self.cid}.pkl', 'rb') as f:
 				state_dict = pickle.load(f)
 			self.set_parameters_bn(state_dict)
-		loss, avg_pearson, avg_rmse, y_true, y_pred = test(self.net, self.testloader, self.y_labels, self.DEVICE)
+		loss, avg_pearson, avg_rmse, avg_ccc, y_true, y_pred = test(self.net, self.testloader, self.y_labels, self.DEVICE)
 
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
-			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
-		# OFFICEDB_MODIFICATIONS.md item 33: raw predictions for CCC/CwM.
+			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse},{avg_ccc}\n')
+		# OFFICEDB_MODIFICATIONS.md item 33: raw predictions for CwM (needs raw
+		# per-annotator ratings not available here); item 34: avg_ccc logged above.
 		np.savez(f'{self.path}/clientwise/preds{int(self.cid)}_round{config["server_round"]}.npz',
 				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels))
-		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
+		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse, "avg_ccc": avg_ccc}
 
 
 class FlowerClient_BN_Root(fl.client.NumPyClient):
@@ -162,10 +163,11 @@ class FlowerClient_BN_Root(fl.client.NumPyClient):
 			self.net.fc_module.load_state_dict(state_dict, strict=True)
 		except:
 			print('')
-		loss, avg_pearson, avg_rmse, y_true, y_pred = test(self.net, self.testloader, self.y_labels, self.DEVICE)
+		loss, avg_pearson, avg_rmse, avg_ccc, y_true, y_pred = test(self.net, self.testloader, self.y_labels, self.DEVICE)
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
-			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
-		# OFFICEDB_MODIFICATIONS.md item 33: raw predictions for CCC/CwM.
+			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse},{avg_ccc}\n')
+		# OFFICEDB_MODIFICATIONS.md item 33: raw predictions for CwM (needs raw
+		# per-annotator ratings not available here); item 34: avg_ccc logged above.
 		np.savez(f'{self.path}/clientwise/preds{int(self.cid)}_round{config["server_round"]}.npz',
 				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels))
-		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
+		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse, "avg_ccc": avg_ccc}

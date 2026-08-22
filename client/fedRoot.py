@@ -81,13 +81,14 @@ class FlowerClient_Root(fl.client.NumPyClient):
 			self.net.fc_module.load_state_dict(state_dict, strict=True)
 		except:
 			print('')
-		loss, avg_pearson, avg_rmse, y_true, y_pred = test(self.net, self.testloader, self.y_labels, self.DEVICE)
+		loss, avg_pearson, avg_rmse, avg_ccc, y_true, y_pred = test(self.net, self.testloader, self.y_labels, self.DEVICE)
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
-			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
-		# OFFICEDB_MODIFICATIONS.md item 33: raw predictions for CCC/CwM.
+			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse},{avg_ccc}\n')
+		# OFFICEDB_MODIFICATIONS.md item 33: raw predictions for CwM (needs raw
+		# per-annotator ratings not available here); item 34: avg_ccc logged above.
 		np.savez(f'{self.path}/clientwise/preds{int(self.cid)}_round{config["server_round"]}.npz',
 				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels))
-		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
+		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse, "avg_ccc": avg_ccc}
 
 
 class FlowerClientCL_Root(fl.client.NumPyClient):
@@ -235,7 +236,7 @@ class FlowerClientCL_Root(fl.client.NumPyClient):
 			y_labels = [self.y_labels[i] for i in active_idx]
 		else:
 			active_idx, y_labels = None, self.y_labels
-		loss, avg_pearson, avg_rmse, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
@@ -381,7 +382,7 @@ class FlowerClient_NR_Root(fl.client.NumPyClient):
 			y_labels = [self.y_labels[i] for i in active_idx]
 		else:
 			active_idx, y_labels = None, self.y_labels
-		loss, avg_pearson, avg_rmse, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
@@ -529,7 +530,7 @@ class FlowerClient_LGR(fl.client.NumPyClient):
 			y_labels = [self.y_labels[i] for i in active_idx]
 		else:
 			active_idx, y_labels = None, self.y_labels
-		loss, avg_pearson, avg_rmse, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')

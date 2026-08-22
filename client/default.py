@@ -69,15 +69,17 @@ class FlowerClient(fl.client.NumPyClient):
 	def evaluate(self, parameters, config):
 		os.makedirs(f'{self.path}/clientwise', exist_ok=True)
 		self.set_parameters(parameters)
-		loss, avg_pearson, avg_rmse, y_true, y_pred = test(self.net, self.testloader, self.y_labels, DEVICE=self.DEVICE)
+		loss, avg_pearson, avg_rmse, avg_ccc, y_true, y_pred = test(self.net, self.testloader, self.y_labels, DEVICE=self.DEVICE)
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
-			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
+			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse},{avg_ccc}\n')
 		# preds{cid}_round{r}.npz (OFFICEDB_MODIFICATIONS.md item 33): raw
-		# per-scene (y_true, y_pred) pairs for this client/round, so CCC/CwM
-		# (eval/metrics.py) can be computed later without retraining.
+		# per-scene (y_true, y_pred) pairs for this client/round, so CwM
+		# (eval/metrics.py, needs raw per-annotator ratings not available
+		# here) can be computed later without retraining. avg_ccc (item 34)
+		# is already logged above -- CCC only needs (y_true, y_pred).
 		np.savez(f'{self.path}/clientwise/preds{int(self.cid)}_round{config["server_round"]}.npz',
 				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels))
-		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse}
+		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse, "avg_ccc": avg_ccc}
 
 
 class FlowerClientScaffold(FlowerClient):
@@ -226,7 +228,7 @@ class FlowerClientCL(fl.client.NumPyClient):
 			y_labels = [self.y_labels[i] for i in active_idx]
 		else:
 			active_idx, y_labels = None, self.y_labels
-		loss, avg_pearson, avg_rmse, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
@@ -345,7 +347,7 @@ class FlowerClient_NR(fl.client.NumPyClient):
 			y_labels = [self.y_labels[i] for i in active_idx]
 		else:
 			active_idx, y_labels = None, self.y_labels
-		loss, avg_pearson, avg_rmse, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
+		loss, avg_pearson, avg_rmse, _, _, _ = test(self.strat.model, eval_loader, y_labels, self.DEVICE, active_idx=active_idx)
 		# append the results to a file
 		with open(f'{self.path}/clientwise/results{int(self.cid)}.txt', 'a+') as f:  # Python 3: open(..., 'wb')
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse}\n')
