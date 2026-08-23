@@ -1384,6 +1384,59 @@ source, not `central.csv`, and FCL/transfer-eval logging formats were left alone
 run as item 33 (step 11 already validates `preds*.npz` keys/shapes; results.txt's new 5th column
 isn't separately asserted by the smoke test, worth a quick manual check on the first real run).
 
+## 35. `dataloader/utils.py`, `client/default.py`, `client/fedBN.py`, `client/fedRoot.py` -- `preds{cid}_round{r}.npz` also persists each row's sample (Stamp) ID
+
+Follow-up to items 33/34, same day (2026-08-23). After confirming the by-room k5 seed-0 sweep's
+`preds*.npz` files were healthy, the user asked whether CwM (still post-hoc per item 34, since it
+needs raw per-annotator ratings) could actually be computed without retraining. It can, but only
+by re-deriving each npz row's underlying sample identity to join against the raw annotation CSV --
+and the row order that join would need to assume is **not actually safe to reproduce**:
+`load_datasets()` (`dataloader/utils.py`) shuffles both `data_images_train` and `data_images_test`
+via `.sample(frac=1)` with no `random_state=`, i.e. it reads from whatever the *global* numpy RNG
+state happens to be at that call, not a value derived solely from `--seed`. In-run this doesn't
+matter (`test()`'s per-round batches iterate the same already-shuffled `Subset` every round, per
+item 21's comment on this file), but re-calling `load_datasets()` in a fresh process to recover
+row order is fragile: it only reproduces the original shuffle if literally no other numpy-RNG-
+consuming call happens between the run's `np.random.seed(args.seed)` (`main.py`) and its one
+`load_datasets()` call, which is true for these single-strategy sweep jobs but is an unstated,
+easily-broken invariant, not something to build a metric on.
+
+**Fix**: thread sample identity through directly instead of trying to reconstruct it.
+`load_datasets()` already builds `test_datasets` as one `torch.utils.data.Subset` per client
+(both the `group_col` by-room/by-robot branch and the plain `random_split` branch) from
+`data_images_test`, whose column 0 is `Stamp` (see `load_images()`). Added a small helper,
+`_subset_source_indices()`, that resolves a `Subset`'s `.indices` down to positions in the
+ultimate root dataset -- needed because `random_split()` wraps *another* Subset (the
+trim-to-partition-size one built just above it in the non-`group_col` branch), so a naive
+one-level `.indices` read is only correct for the `group_col` branch. Right after `test_datasets`
+is built (before the `testloaders` list comprehension), each `Subset` gets a plain `.sample_ids`
+attribute: `data_images_test.iloc[_subset_source_indices(ds), 0].tolist()`, in the exact order
+that `Subset`'s `shuffle=False` `DataLoader` will iterate it -- so `test()`'s output row *i*
+always corresponds to `sample_ids[i]`, no separate bookkeeping needed at the call site. This is
+attached as an attribute, not a new return value, so `load_datasets()`'s return arity/call sites
+(`main.py` x2, `run_fl.py`, `transfer_eval.py`, `pretrain.py`) are untouched.
+
+The same 4 FL-sweep decentralized `evaluate()` methods items 33/34 touched
+(`client/default.py`'s `FlowerClient.evaluate()`, `client/fedBN.py`'s
+`FlowerClient_BN.evaluate()`/`FlowerClient_BN_Root.evaluate()`, `client/fedRoot.py`'s
+`FlowerClient_Root.evaluate()`) now add one more key to the `np.savez(...)` call:
+`sample_id=np.array(getattr(self.testloader.dataset, 'sample_ids', []))`. The `getattr(...,  [])`
+fallback means this degrades gracefully (empty array, not a crash) if `evaluate()` is ever called
+against a loader that didn't go through the patched `load_datasets()`. Purely additive: existing
+`preds*.npz` files without this key remain valid; nothing that reads `y_true`/`y_pred`/`y_labels`
+changes. No changes to `CustomDataset`, `test()`'s signature, or any of the ~14 other
+`test()`/`load_datasets()` call sites.
+
+With `sample_id` saved, RMSE/PCC/CCC were already computable directly from `y_true`/`y_pred`
+(item 33/34); CwM is now a straightforward post-hoc join (`sample_id` -> raw per-annotator rows in
+the source CSV) with no dependence on reproducing dataloader shuffle order, and no retraining or
+re-inference needed for any of the four metrics.
+
+**Verification**: smoke-tested via a small `sintr` run before resubmitting the full by-room k5
+seed-0 sweep (34203283-347) -- confirmed `sample_id` lands in a fresh `preds*.npz`, is non-empty,
+matches `y_true`'s row count, and its values are plausible `Stamp` floats. See
+`smoke_test/run_smoke_test.sh` step 11 for the automated check.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

@@ -39,6 +39,23 @@ _DEFAULT_EXTRA_COLS = ['Using circle', 'Using arrow']
 NUM_WORKERS = 2
 
 
+def _subset_source_indices(subset):
+	"""Resolve a (possibly nested) torch Subset's .indices down to positions
+	in its ultimate root dataset. random_split() wraps ANOTHER Subset (the
+	trimmed-to-partition-size one built just above it), so a naive one-level
+	`.indices` read is only correct for the group_col branch's single-level
+	Subsets -- this also handles the random_split branch's nesting, so
+	sample-id lookup (OFFICEDB_MODIFICATIONS.md item 35) is correct either
+	way without relying on random_split's inner Subset happening to be an
+	identity range."""
+	indices = list(subset.indices)
+	base = subset.dataset
+	while isinstance(base, torch.utils.data.Subset):
+		indices = [base.indices[i] for i in indices]
+		base = base.dataset
+	return indices
+
+
 def load_universal(path, stamp_col='Stamp', mean_cols=None):
 	data = pd.read_csv(path + "/all_data.csv")
 	# mean_cols are averaged across annotators per stamp (original behaviour);
@@ -259,6 +276,14 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 		test_datasets = random_split(
 			torch.utils.data.Subset(testset, range(test_partition_size * num_clients)),
 			test_lengths, torch.Generator().manual_seed(42))
+	# sample_ids (OFFICEDB_MODIFICATIONS.md item 35): each per-client test
+	# Subset's Stamp values, in the exact same order the (shuffle=False,
+	# below) testloader will iterate them -- so test()'s row-i output lines
+	# up with sample_ids[i] with no extra bookkeeping at the call site.
+	# Attached as a plain attribute (not a new return value) so this doesn't
+	# touch load_datasets()'s return arity / any of its other call sites.
+	for ds in test_datasets:
+		ds.sample_ids = data_images_test.iloc[_subset_source_indices(ds), 0].tolist()
 	testloaders = [DataLoader(ds, batch_size=batch_size, num_workers=NUM_WORKERS) for ds in test_datasets]
 
 	testloader = DataLoader(testset, batch_size=batch_size, num_workers=NUM_WORKERS)

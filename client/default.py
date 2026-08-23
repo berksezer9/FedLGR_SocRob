@@ -77,8 +77,15 @@ class FlowerClient(fl.client.NumPyClient):
 		# (eval/metrics.py, needs raw per-annotator ratings not available
 		# here) can be computed later without retraining. avg_ccc (item 34)
 		# is already logged above -- CCC only needs (y_true, y_pred).
+		# sample_id (item 35): the per-scene Stamp for each row, in the same
+		# order -- lets any post-hoc metric (e.g. CwM, or a per-action
+		# breakdown) join back to raw annotation data without needing to
+		# reproduce the dataloader's row order, which load_datasets()'s
+		# unseeded data_images_test.sample(frac=1) reshuffle otherwise makes
+		# unsafe to assume across a fresh process.
 		np.savez(f'{self.path}/clientwise/preds{int(self.cid)}_round{config["server_round"]}.npz',
-				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels))
+				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels),
+				 sample_id=np.array(getattr(self.testloader.dataset, 'sample_ids', [])))
 		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse, "avg_ccc": avg_ccc}
 
 

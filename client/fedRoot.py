@@ -86,8 +86,11 @@ class FlowerClient_Root(fl.client.NumPyClient):
 			f.write(f'{config["server_round"]},{loss},{avg_pearson},{avg_rmse},{avg_ccc}\n')
 		# OFFICEDB_MODIFICATIONS.md item 33: raw predictions for CwM (needs raw
 		# per-annotator ratings not available here); item 34: avg_ccc logged above.
+		# item 35: sample_id lets y_true/y_pred be joined back to any raw
+		# annotation data post-hoc without retraining/re-inferring.
 		np.savez(f'{self.path}/clientwise/preds{int(self.cid)}_round{config["server_round"]}.npz',
-				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels))
+				 y_true=y_true, y_pred=y_pred, y_labels=np.array(self.y_labels),
+				 sample_id=np.array(getattr(self.testloader.dataset, 'sample_ids', [])))
 		return float(loss), len(self.testloader), {"avg_pearson_score": avg_pearson, "avg_rmse": avg_rmse, "avg_ccc": avg_ccc}
 
 
