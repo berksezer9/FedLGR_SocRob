@@ -1437,6 +1437,61 @@ seed-0 sweep (34203283-347) -- confirmed `sample_id` lands in a fresh `preds*.np
 matches `y_true`'s row count, and its values are plausible `Stamp` floats. See
 `smoke_test/run_smoke_test.sh` step 11 for the automated check.
 
+## 36. `transfer_eval.py` -- domain-transfer k-fold eval jobs now also capture CCC + raw predictions (items 33/34/35's last unfixed caller)
+
+Follow-up to items 33/34/35, raised 2026-08-26 after the by-robot k5 sweep's own CCC/CwM fix
+prompted a check of the domain-transfer k-fold sweep's 60 already-completed eval jobs
+(`results/fedlgr_officedb/domain_transfer/kfold_reliability/`) -- item 33's own text named
+`transfer_eval.py`'s 3 `test()` call sites as updated only enough to match the new tuple arity
+(`_, _, _` to discard `avg_ccc`/`labels_np`/`outputs_np`), not to persist them. So this file was
+always the one caller items 33/34/35 explicitly left alone, and the 60 kfold jobs' result JSONs
+only ever contained `{loss, pcc, rmse}` -- confirmed by reading the actual files, nothing to
+recover post-hoc. All 30 pretrain checkpoints verified intact (correct size, timestamps matching
+the sweep window) -- this fix needed a rerun of the 60 eval jobs only, no retraining.
+
+**Fix**: `run()` now captures `ccc, y_true, y_pred` at all 3 `test()` call sites (zero-shot,
+early-stopped finetune, fixed-epoch finetune) instead of discarding them, adds `'ccc'` to the
+corresponding `results['zero_shot']`/`results['finetuned']` dict, and writes a
+`preds_{zeroshot,finetuned}.npz` per job (derived from `--output`'s path, e.g.
+`ceiling_es_office_nao_..._preds_zeroshot.npz`) with the same 4-key schema as items 33/34/35's
+`clientwise/preds{cid}_round{r}.npz` (`y_true`, `y_pred`, `y_labels`, `sample_id`) -- two files
+when a finetune pass runs (zero-shot and finetuned are different model states with different
+predictions), one when it doesn't.
+
+`sample_id` needed switching which `load_datasets()` loader `test()` is called on: `run()`
+previously called it on the pooled `testloader`, which -- unlike the per-client split item 35
+attached `.dataset.sample_ids` to -- carries no sample-id attribute at all. Since this file always
+calls `load_datasets(num_clients=1, ...)`, `testloaders_per_client[0]` (previously discarded as
+`_testloaders_per_client`) covers the exact same rows as the pooled loader, just built via the
+per-client `Subset` path that already has `sample_ids` populated -- so `run()` now evaluates
+against `testloaders_per_client[0]` (renamed `eval_loader`) instead of the pooled loader. RMSE/
+PCC/CCC are computed over the full concatenated batch regardless of iteration order (item 21), so
+this doesn't change what's measured, only where `sample_id` comes from; values may shift in the
+last few decimal places vs. the archived pre-fix numbers (different DataLoader batching -> CPU
+float reduction order) but shouldn't move meaningfully, per the same caveat item 21's own fix
+noted.
+
+Pre-fix result JSONs (all 60) archived to
+`results/fedlgr_officedb/domain_transfer/kfold_reliability/pre_predfix/` before the rerun, mirroring
+the by-robot k5 `pre_predfix/` convention -- see
+[[project_officedb_cv_vs_multiseed_protocol]]/[[project_officedb_domain_transfer_ccc_cwm_fix_plan]].
+
+**Verification**: smoke-tested against a real checkpoint
+(`checkpoints_domain_transfer/office_nao_kfold5_test0_seed0/cpu/MobileNet.pkl`, job 34417301,
+zero-shot only) before resubmitting the full 60-job rerun -- confirmed `ccc` lands in the output
+JSON as a finite float, and the `preds_zeroshot.npz` has all 4 keys, `y_true`/`y_pred` shaped
+(200, 9) with no NaNs, `sample_id` non-empty with plausible Stamp values, and row counts matching.
+The early-stopped-finetune branch (`results['finetuned']` + its `preds_finetuned.npz`) shares this
+exact `test()`/`save_preds()` code, exercised by the zero-shot smoke test -- not separately
+smoke-tested end-to-end (a finetune pass runs ~35-110 min per the original sweep's timings, vs.
+the zero-shot smoke job's ~3 min) but reuses the same already-verified call, differing only by the
+unmodified, pre-existing `train_with_early_stopping` step in between.
+
+Also added `--eval-only` to `fedlgr_officedb/slurm/submit_domain_transfer_kfold.py` (this
+project's own code, not vendor) -- skips `submit_pretrain` and points straight at the existing
+`checkpoints_domain_transfer/.../cpu/MobileNet.pkl` paths (no `--dependency`, since there's no new
+pretrain job), for exactly this kind of eval-only rerun against already-trained checkpoints.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

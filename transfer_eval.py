@@ -20,6 +20,7 @@ from models.deepLabMobileNet import Net as deepNet
 import torch
 import argparse
 import json
+import os
 import pickle
 import random
 import numpy as np
@@ -53,14 +54,33 @@ def run(args):
     action_cols = args.action_cols.split(',') if args.action_cols else None
     extra_cols = args.extra_cols.split(',') if args.extra_cols else None
 
-    trainloaders, _testloaders_per_client, testloader, y_labels, _ = load_datasets(
+    trainloaders, testloaders_per_client, _pooled_testloader, y_labels, _ = load_datasets(
         num_clients=1, path=args.data, aug=args.aug, batch_size=args.batch_size,
         DEVICE=DEVICE, action_cols=action_cols, extra_cols=extra_cols, split_col='Split')
+    # eval_loader (OFFICEDB_MODIFICATIONS.md item 36): num_clients=1 means
+    # testloaders_per_client[0] covers the exact same rows as the pooled
+    # _pooled_testloader (just built via load_datasets()'s per-client Subset
+    # path instead), but -- unlike the pooled loader -- it carries the
+    # .dataset.sample_ids attribute item 35 attached to the per-client FL
+    # split. Switching to it (instead of _pooled_testloader) is what makes
+    # sample_id available here at all; RMSE/PCC/CCC are permutation-invariant
+    # over the same underlying rows so this doesn't change what's measured.
+    eval_loader = testloaders_per_client[0]
+
+    def save_preds(tag, y_true, y_pred):
+        # Mirrors client/default.py's FlowerClient.evaluate() preds*.npz
+        # schema exactly (item 33/34/35) so downstream CCC/CwM post-hoc
+        # tooling doesn't need a transfer-eval-specific reader.
+        base, _ext = os.path.splitext(args.output)
+        np.savez(f'{base}_preds_{tag}.npz', y_true=y_true, y_pred=y_pred,
+                 y_labels=np.array(y_labels),
+                 sample_id=np.array(getattr(eval_loader.dataset, 'sample_ids', [])))
 
     results = {}
-    loss, pcc, rmse, _, _, _ = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
-    print("Zero-shot:", loss, pcc, rmse)
-    results['zero_shot'] = {'loss': loss, 'pcc': pcc, 'rmse': rmse}
+    loss, pcc, rmse, ccc, y_true, y_pred = test(net=model, testloader=eval_loader, y_labels=y_labels, DEVICE=DEVICE)
+    print("Zero-shot:", loss, pcc, rmse, ccc)
+    results['zero_shot'] = {'loss': loss, 'pcc': pcc, 'rmse': rmse, 'ccc': ccc}
+    save_preds('zeroshot', y_true, y_pred)
 
     if args.early_stopping:
         # Val-loss early stopping for the fine-tune phase too
@@ -76,14 +96,16 @@ def run(args):
         best_epoch, best_val_loss = train_with_early_stopping(
             model=model, train_loader=trainloaders[0], val_loader=val_loader, DEVICE=DEVICE,
             y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience)
-        loss, pcc, rmse, _, _, _ = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
-        print(f"Fine-tuned (early-stopped at epoch {best_epoch}, val loss {best_val_loss}):", loss, pcc, rmse)
-        results['finetuned'] = {'epochs': best_epoch, 'val_loss': best_val_loss, 'loss': loss, 'pcc': pcc, 'rmse': rmse}
+        loss, pcc, rmse, ccc, y_true, y_pred = test(net=model, testloader=eval_loader, y_labels=y_labels, DEVICE=DEVICE)
+        print(f"Fine-tuned (early-stopped at epoch {best_epoch}, val loss {best_val_loss}):", loss, pcc, rmse, ccc)
+        results['finetuned'] = {'epochs': best_epoch, 'val_loss': best_val_loss, 'loss': loss, 'pcc': pcc, 'rmse': rmse, 'ccc': ccc}
+        save_preds('finetuned', y_true, y_pred)
     elif args.finetune_epochs > 0:
         train(model=model, train_loader=trainloaders[0], epochs=args.finetune_epochs, DEVICE=DEVICE)
-        loss, pcc, rmse, _, _, _ = test(net=model, testloader=testloader, y_labels=y_labels, DEVICE=DEVICE)
-        print(f"Fine-tuned ({args.finetune_epochs} epochs):", loss, pcc, rmse)
-        results['finetuned'] = {'epochs': args.finetune_epochs, 'loss': loss, 'pcc': pcc, 'rmse': rmse}
+        loss, pcc, rmse, ccc, y_true, y_pred = test(net=model, testloader=eval_loader, y_labels=y_labels, DEVICE=DEVICE)
+        print(f"Fine-tuned ({args.finetune_epochs} epochs):", loss, pcc, rmse, ccc)
+        results['finetuned'] = {'epochs': args.finetune_epochs, 'loss': loss, 'pcc': pcc, 'rmse': rmse, 'ccc': ccc}
+        save_preds('finetuned', y_true, y_pred)
 
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
