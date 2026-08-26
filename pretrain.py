@@ -1,6 +1,7 @@
 from dataloader.utils import load_datasets_pretrain, load_datasets, load_val_loader
 from models.deepLabMobileNet import Net as deepNet
 from models.MobileNet import Net as mobNet
+from models.ResNet50 import Net as resNet50
 import torch
 import argparse
 import pickle
@@ -46,6 +47,9 @@ def run(args):
     elif args.models == 'MobileNet':
         models=[mobNet(num_classes=args.num_classes)]
         names=['MobileNet']
+    elif args.models == 'ResNet50':
+        models=[resNet50(num_classes=args.num_classes)]
+        names=['ResNet50']
 
     # action_cols/extra_cols=None (default) reproduce MANNERS-DB's 8 hardcoded
     # action names + 'Using circle'/'Using arrow'; OfficeDB adaptation passes

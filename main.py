@@ -164,6 +164,8 @@ def run(args):
         from models.MobileNet import Net
     elif args.model == 'DeepLabMobileNet':
         from models.deepLabMobileNet import Net
+    elif args.model == 'ResNet50':
+        from models.ResNet50 import Net
 
     # None (default) reproduces vendor's original MANNERS-DB column names; a
     # comma-separated --action_cols/--extra_cols CLI value overrides them

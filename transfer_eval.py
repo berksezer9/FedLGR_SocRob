@@ -17,6 +17,7 @@ slice.
 from dataloader.utils import load_datasets, load_val_loader
 from models.MobileNet import Net as mobNet
 from models.deepLabMobileNet import Net as deepNet
+from models.ResNet50 import Net as resNet50
 import torch
 import argparse
 import json
@@ -45,6 +46,8 @@ def run(args):
 
     if args.model == 'DeepLabMobileNet':
         model = deepNet(num_classes=args.num_classes)
+    elif args.model == 'ResNet50':
+        model = resNet50(num_classes=args.num_classes)
     else:
         model = mobNet(num_classes=args.num_classes)
 
@@ -117,7 +120,7 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint', required=True, help='Path to a pretrain.py-produced .pkl checkpoint')
     parser.add_argument('--data', required=True, help='Path to target-domain prepared dataset (Split col required)')
     parser.add_argument('--output', required=True, help='Path to write results JSON')
-    parser.add_argument('--model', default='MobileNet', choices=['MobileNet', 'DeepLabMobileNet'])
+    parser.add_argument('--model', default='MobileNet', choices=['MobileNet', 'DeepLabMobileNet', 'ResNet50'])
     parser.add_argument('--finetune_epochs', type=int, default=0,
                          help='If >0, fine-tune on the target train split before a second eval pass. '
                               'Ignored if --early_stopping is set.')

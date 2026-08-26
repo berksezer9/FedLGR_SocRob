@@ -1492,6 +1492,51 @@ project's own code, not vendor) -- skips `submit_pretrain` and points straight a
 `checkpoints_domain_transfer/.../cpu/MobileNet.pkl` paths (no `--dependency`, since there's no new
 pretrain job), for exactly this kind of eval-only rerun against already-trained checkpoints.
 
+## 37. `models/ResNet50.py` (new), `pretrain.py`, `main.py`, `transfer_eval.py` -- add ResNet-50 as a second, heavier CNN backbone
+
+Backbone-diversification follow-up (2026-08-26/27, `docs/paper_prep_2027/ws_domain_transfer_backbone_diversification.md`
+§6, `docs/resnet50_domain_transfer_kfold_plan.md`): the domain-transfer/zero-shot
+comparison arm only had one CNN (MobileNetV2). Testing it against same-family lighter
+siblings would be a near-null-result experiment (MobileNetV2/V3-Small/V4-Conv-Small
+cluster within ~1 accuracy point under matched training); testing capacity *upward*
+against ResNet-50 (25.6M params vs. MobileNetV2's 3.4M) actually brackets the CNN lane
+the way the VLM lane already brackets scale (3B vs. ~8B).
+
+New `models/ResNet50.py`, following the exact per-model pattern `models/MobileNet.py`
+and `models/deepLabMobileNet.py` already use (self-contained `conv` + `FCNet` + `Net`):
+`torchvision.models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)` with `model.fc`
+replaced by `nn.Identity()` -- torchvision's `ResNet.forward()` already does avgpool +
+flatten before `self.fc`, so this yields the flattened 2048-dim pooled feature directly
+without needing MobileNet.py's separate `AdaptiveAvgPool2d`/`Flatten` bolted on. `FCNet`
+mirrors MobileNet's head exactly (`BatchNorm1d -> Linear(->32) -> Linear(32,
+num_classes)`) except the first layer's input width is **2048, not 1280** -- forced by
+ResNet-50's wider pooled feature, not a stylistic change; nothing else about the head
+was altered (no justification found to change it).
+
+Registered `'ResNet50'` alongside `'MobileNet'`/`'DeepLabMobileNet'` in the same 3
+dispatch points those two already use: `pretrain.py`'s `args.models` elif chain,
+`main.py`'s `args.model` elif chain (FCL/FL entrypoint -- not exercised by this
+experiment, kept consistent for parity), and `transfer_eval.py`'s `args.model` dispatch
+(also added to its `--model` `choices=`). `main_fcl.py` (LGR/EWC/FedRoot FCL path,
+including its hardcoded `input_dim = 1280` for the LGR replay generator) is
+**deliberately not touched** -- this experiment runs through `pretrain.py`/
+`transfer_eval.py` only, never `main_fcl.py`.
+
+Checkpoint/results paths: existing MobileNet kfold_reliability filenames carry no model
+tag, so `fedlgr_officedb/slurm/submit_domain_transfer_kfold.py` (this project's own
+code, not vendor) got a `--model` flag (default `MobileNet`, unchanged behavior) that
+routes ResNet-50 runs to sibling paths --
+`checkpoints_domain_transfer/{domain}_{robot}_kfold5_test{fold}_seed{seed}_resnet50/`
+and `results/fedlgr_officedb/domain_transfer/kfold_reliability_resnet50/` -- instead of
+colliding with MobileNet's un-suffixed ones. The sbatch scripts
+(`domain_transfer_{pretrain,eval}.sbatch`) already accepted a `MODEL` env var (default
+`MobileNet`) from item 23's era; this is the first time it's actually driven with a
+second value.
+
+**Verification**: smoke-tested one robot/fold (Nao, office, fold 0, zero-shot ceiling
+only) end-to-end on a CPU job before submitting the full sweep -- see
+`docs/resnet50_domain_transfer_kfold_plan.md` for the smoke-test job ID and result.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB
