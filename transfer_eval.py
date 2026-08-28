@@ -98,7 +98,8 @@ def run(args):
             sys.exit("--early_stopping requires 'val' rows in --data (none found)")
         best_epoch, best_val_loss = train_with_early_stopping(
             model=model, train_loader=trainloaders[0], val_loader=val_loader, DEVICE=DEVICE,
-            y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience)
+            y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience,
+            lr=args.lr, clip_grad_norm=args.clip_grad)
         loss, pcc, rmse, ccc, y_true, y_pred = test(net=model, testloader=eval_loader, y_labels=y_labels, DEVICE=DEVICE)
         print(f"Fine-tuned (early-stopped at epoch {best_epoch}, val loss {best_val_loss}):", loss, pcc, rmse, ccc)
         results['finetuned'] = {'epochs': best_epoch, 'val_loss': best_val_loss, 'loss': loss, 'pcc': pcc, 'rmse': rmse, 'ccc': ccc}
@@ -142,6 +143,14 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=None,
                          help='Seed random/numpy/torch before the fine-tune phase (multi-seed '
                               'reliability reruns). Default None: unseeded, unchanged prior behavior.')
+    parser.add_argument('--lr', type=float, default=0.001,
+                         help='Adam learning rate for the --early_stopping fine-tune phase (default '
+                              '0.001, original hardcoded value). CNN domain-transfer arm passes 1e-4 '
+                              '-- OFFICEDB_MODIFICATIONS.md item 38.')
+    parser.add_argument('--clip_grad', type=float, default=None,
+                         help='If set, clip_grad_norm_ max-norm before optimizer.step() in the '
+                              '--early_stopping fine-tune phase (default None: no clipping). CNN '
+                              'domain-transfer arm passes 1.0 -- OFFICEDB_MODIFICATIONS.md item 38.')
     args = parser.parse_args()
 
     run(args)

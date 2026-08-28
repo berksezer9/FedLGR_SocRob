@@ -1537,6 +1537,42 @@ second value.
 only) end-to-end on a CPU job before submitting the full sweep -- see
 `docs/resnet50_domain_transfer_kfold_plan.md` for the smoke-test job ID and result.
 
+## 38. `utils.py`, `pretrain.py`, `transfer_eval.py` -- optional `lr` / `clip_grad` for the CNN domain-transfer training-instability rerun
+
+`train_with_early_stopping()` (`utils.py`) hardcoded `optim.Adam(model.parameters(),
+lr=0.001)` with no gradient clipping. That LR is a *from-scratch* Adam rate and was only
+ever validated for MobileNetV2 on MANNERS-DB upstream. On the domain-transfer arm's
+ImageNet-pretrained full-network fine-tune it destabilises ResNet-50: per-epoch logs show
+isolated val-loss spikes (to 5 / 16 / 412, once ~9.07e6) with the early-stopping best
+epoch always 5-8/40 and train loss never nearing 0 -- an under-fit early-stopped
+checkpoint, not a converged model. MobileNetV2 is stable at the same LR. Full analysis,
+recipe decision + literature: `docs/cnn_training_instability_investigation_plan.md`
+(and memory `reference_cnn_finetuning_literature`).
+
+`train_with_early_stopping()` gained two keyword args, **both defaulting to the original
+behaviour exactly**: `lr=0.001` and `clip_grad_norm=None` (None => no
+`clip_grad_norm_` call). `train()` / `train_scaffold()` -- the federated per-round
+local-training paths -- are **deliberately not touched**; only the early-stopped
+pretrain/fine-tune path the domain-transfer arm uses is parametrised.
+
+Threaded through as optional args that pass nothing unless set (so every prior
+run/checkpoint is byte-for-byte unaffected):
+`pretrain.py --lr/--clip_grad` and `transfer_eval.py --lr/--clip_grad` -> the two keyword
+args above. This project's wrappers add matching `--lr/--clip_grad` to
+`fedlgr_officedb/pretrain_officedb.py` and `transfer_office_to_home.py`, and `LR`/`CLIP_GRAD`
+env vars to `domain_transfer_{pretrain,eval}.sbatch`.
+`fedlgr_officedb/slurm/submit_domain_transfer_kfold.py` gained `--lr / --clip-grad /
+--max-epochs / --patience / --run-tag`; a non-empty `--run-tag` is appended to the results
+dir **and** every checkpoint dir, and is *required* whenever `--lr`/`--clip-grad` are given,
+so the revised-recipe rerun writes to
+`kfold_reliability[_resnet50]_<tag>/` +
+`checkpoints_domain_transfer/{domain}_{robot}_kfold5_test{fold}_seed{seed}[_resnet50]_<tag>/`
+and never overwrites the matched-recipe (1e-3) sweep.
+
+**Rerun recipe** (identical for both backbones -- reported as an ablation, not a silent
+replacement): `--lr 1e-4 --clip-grad 1.0 --max-epochs 60 --patience 8 --run-tag
+lr1e4_clip1_es60p8`.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

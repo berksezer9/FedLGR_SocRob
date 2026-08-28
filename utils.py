@@ -231,7 +231,18 @@ def train_scaffold(model, train_loader, epochs, DEVICE, correction):
 	return peak_ramu
 
 
-def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels, max_epochs=40, patience=5):
+def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels, max_epochs=40, patience=5,
+							  lr=0.001, clip_grad_norm=None):
+	# lr / clip_grad_norm (OFFICEDB_MODIFICATIONS.md item 38): both default to
+	# the original hardcoded behaviour (Adam lr=1e-3, no clipping). The CNN
+	# domain-transfer arm passes lr=1e-4 + clip_grad_norm=1.0 -- the hardcoded
+	# 1e-3 is a from-scratch Adam rate that was only ever validated for
+	# MobileNetV2 on MANNERS-DB and destabilises ResNet-50's full-network
+	# fine-tune (isolated val-loss spikes to ~9e6; see
+	# docs/cnn_training_instability_investigation_plan.md). Only this function
+	# takes the new params -- train()/train_scaffold() are the federated
+	# per-round local-training paths and are deliberately left untouched.
+	#
 	# Val-loss-based early stopping + best-checkpoint selection
 	# (OFFICEDB_MODIFICATIONS.md item 25), added because the domain-transfer
 	# experiment's original fixed --epochs count had no way to tell
@@ -251,8 +262,10 @@ def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels,
 	# per round, not "train until convergence") -- those call sites are
 	# unaffected by this addition.
 	criterion = nn.MSELoss()
-	optimizer = optim.Adam(model.parameters(), lr=0.001)
+	optimizer = optim.Adam(model.parameters(), lr=lr)
 	model.to(DEVICE)
+	print(f"train_with_early_stopping: lr={lr}, clip_grad_norm={clip_grad_norm}, "
+		  f"max_epochs={max_epochs}, patience={patience}")
 
 	best_val_loss = float('inf')
 	best_state = None
@@ -268,6 +281,8 @@ def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels,
 			outputs = model(images)
 			loss = criterion(outputs, labels)
 			loss.backward()
+			if clip_grad_norm is not None:
+				torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
 			optimizer.step()
 			running_loss += loss.item()
 		train_loss = running_loss / len(train_loader)

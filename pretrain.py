@@ -97,7 +97,8 @@ def run(args):
         if args.early_stopping:
             best_epoch, best_val_loss = train_with_early_stopping(
                 model=model, train_loader=train_loader, val_loader=val_loader, DEVICE=DEVICE,
-                y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience)
+                y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience,
+                lr=args.lr, clip_grad_norm=args.clip_grad)
             print(f"Early-stopped at epoch {best_epoch} (val loss {best_val_loss})")
         else:
             train(model=model, train_loader=train_loader, epochs=args.epochs, DEVICE=DEVICE)
@@ -142,6 +143,14 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=None,
                          help='Seed random/numpy/torch before model init and training, for multi-seed '
                               'reruns. Default None: unseeded (original behavior, unchanged).')
+    parser.add_argument('--lr', type=float, default=0.001,
+                         help='Adam learning rate for --early_stopping training (default 0.001, the '
+                              'original hardcoded value). CNN domain-transfer arm passes 1e-4 -- see '
+                              'OFFICEDB_MODIFICATIONS.md item 38.')
+    parser.add_argument('--clip_grad', type=float, default=None,
+                         help='If set, clip_grad_norm_ max-norm applied before optimizer.step() in '
+                              '--early_stopping training (default None: no clipping, original behavior). '
+                              'CNN domain-transfer arm passes 1.0 -- OFFICEDB_MODIFICATIONS.md item 38.')
     args = parser.parse_args()
 
     print("Running with following arguments:")
