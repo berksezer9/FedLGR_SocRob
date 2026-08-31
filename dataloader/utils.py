@@ -125,7 +125,12 @@ def load_images(path, action_cols=None, extra_cols=None, stamp_col='Stamp'):
 
 
 def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.device("cpu"), data_permutation=None,
-				  distil=False, teacher_model=None, action_cols=None, extra_cols=None, split_col=None, group_col=None):
+				  distil=False, teacher_model=None, action_cols=None, extra_cols=None, split_col=None, group_col=None,
+				  resolution=128):
+	# resolution: input square side for transforms.Resize (default 128 =
+	# exact prior behaviour, the vendor's GPU-memory-driven downsize). The
+	# CNN domain-transfer 224px test (OFFICEDB_MODIFICATIONS.md item 39)
+	# passes 224 = both backbones' native ImageNet resolution.
 	# action_cols/extra_cols: see load_images. split_col: if given and present
 	# in the built dataframe, honor its train/test labels instead of the
 	# internal random 75/25 split (lets this reuse data/splits/*.csv's
@@ -158,7 +163,7 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 
 	if aug:
 		train_transform = transforms.Compose([
-			transforms.Resize((128, 128)),
+			transforms.Resize((resolution, resolution)),
 			transforms.RandomHorizontalFlip(),
 			transforms.RandomRotation(10),
 			# transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
@@ -171,12 +176,12 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 
 	else:
 		train_transform = transforms.Compose([
-			transforms.Resize((128, 128)),  # Adjust the size according to your model requirements
+			transforms.Resize((resolution, resolution)),  # Adjust the size according to your model requirements
 			transforms.ToTensor(),
 			transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 		])
 	test_transform = transforms.Compose([
-		transforms.Resize((128, 128)),  # Adjust the size according to your model requirements
+		transforms.Resize((resolution, resolution)),  # Adjust the size according to your model requirements
 		transforms.ToTensor(),
 		transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 	])
@@ -291,7 +296,7 @@ def load_datasets(num_clients, path, aug, batch_size=16, out='', DEVICE=torch.de
 	return trainloaders, testloaders, testloader, y_labels, data_permutation
 
 
-def load_val_loader(path, batch_size=16, action_cols=None, extra_cols=None, split_col='Split'):
+def load_val_loader(path, batch_size=16, action_cols=None, extra_cols=None, split_col='Split', resolution=128):
 	# Standalone val-split loader for early-stopping-based checkpoint
 	# selection (OFFICEDB_MODIFICATIONS.md item 23). Deliberately independent
 	# of load_datasets()'s train/test return contract -- adding a val loader
@@ -318,7 +323,7 @@ def load_val_loader(path, batch_size=16, action_cols=None, extra_cols=None, spli
 	data_images_val = data_images_val.sample(frac=1).reset_index(drop=True)
 
 	val_transform = transforms.Compose([
-		transforms.Resize((128, 128)),
+		transforms.Resize((resolution, resolution)),
 		transforms.ToTensor(),
 		transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 	])
@@ -327,7 +332,7 @@ def load_val_loader(path, batch_size=16, action_cols=None, extra_cols=None, spli
 
 
 def load_datasets_pretrain(num_clients, path, split, aug=True, batch_size=16, out='', DEVICE=torch.device("cpu"),
-						   data_permutation=None, action_cols=None, extra_cols=None):
+						   data_permutation=None, action_cols=None, extra_cols=None, resolution=128):
 	action_cols = list(action_cols) if action_cols is not None else list(_DEFAULT_ACTION_COLS)
 	extra_cols = list(extra_cols) if extra_cols is not None else list(_DEFAULT_EXTRA_COLS)
 	label_start = 2 + len(extra_cols)
@@ -344,7 +349,7 @@ def load_datasets_pretrain(num_clients, path, split, aug=True, batch_size=16, ou
 	data_images_test = data.iloc[int(data.shape[0] * (1 - split)):]
 
 	test_transform = transforms.Compose([
-		transforms.Resize((128, 128)),  # Adjust the size according to your model requirements
+		transforms.Resize((resolution, resolution)),  # Adjust the size according to your model requirements
 		transforms.RandomHorizontalFlip(),
 		transforms.RandomRotation(10),
 		transforms.ToTensor(),

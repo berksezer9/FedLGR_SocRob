@@ -59,7 +59,8 @@ def run(args):
 
     trainloaders, testloaders_per_client, _pooled_testloader, y_labels, _ = load_datasets(
         num_clients=1, path=args.data, aug=args.aug, batch_size=args.batch_size,
-        DEVICE=DEVICE, action_cols=action_cols, extra_cols=extra_cols, split_col='Split')
+        DEVICE=DEVICE, action_cols=action_cols, extra_cols=extra_cols, split_col='Split',
+        resolution=args.resolution)
     # eval_loader (OFFICEDB_MODIFICATIONS.md item 36): num_clients=1 means
     # testloaders_per_client[0] covers the exact same rows as the pooled
     # _pooled_testloader (just built via load_datasets()'s per-client Subset
@@ -93,7 +94,7 @@ def run(args):
         # overfitting" on the target domain's train split. Uses the
         # target's own 'val' rows (args.data, same dir as trainloaders[0]).
         val_loader = load_val_loader(args.data, batch_size=args.batch_size, action_cols=action_cols,
-                                      extra_cols=extra_cols, split_col='Split')
+                                      extra_cols=extra_cols, split_col='Split', resolution=args.resolution)
         if val_loader is None:
             sys.exit("--early_stopping requires 'val' rows in --data (none found)")
         best_epoch, best_val_loss = train_with_early_stopping(
@@ -151,6 +152,10 @@ if __name__ == "__main__":
                          help='If set, clip_grad_norm_ max-norm before optimizer.step() in the '
                               '--early_stopping fine-tune phase (default None: no clipping). CNN '
                               'domain-transfer arm passes 1.0 -- OFFICEDB_MODIFICATIONS.md item 38.')
+    parser.add_argument('--resolution', type=int, default=128,
+                         help='Square input side for transforms.Resize (default 128, the vendor\'s '
+                              'hardcoded value). Must match the checkpoint\'s pretrain resolution. CNN '
+                              'domain-transfer 224px test passes 224 -- OFFICEDB_MODIFICATIONS.md item 39.')
     args = parser.parse_args()
 
     run(args)

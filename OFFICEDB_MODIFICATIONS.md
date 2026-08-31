@@ -1573,6 +1573,39 @@ and never overwrites the matched-recipe (1e-3) sweep.
 replacement): `--lr 1e-4 --clip-grad 1.0 --max-epochs 60 --patience 8 --run-tag
 lr1e4_clip1_es60p8`.
 
+## 39. `dataloader/utils.py`, `pretrain.py`, `transfer_eval.py` -- optional `resolution` for the CNN domain-transfer 224px test
+
+`transforms.Resize((128, 128))` was hardcoded in `dataloader/utils.py` (5 occurrences
+across the 3 functions the domain-transfer path uses: `load_datasets` x3, `load_val_loader`
+x1, `load_datasets_pretrain` x1). 128px was the vendor's GPU-memory-driven downsize for
+*federated multi-client* training on one GPU -- a constraint that does not apply to the
+domain-transfer pipeline (single model, `num_clients=1`, CPU). Both backbones' ImageNet
+weights (`ResNet50_Weights.IMAGENET1K_V2` / `MobileNet_V2_Weights.IMAGENET1K_V1`) were
+trained at 224px, so 128px imposes a train/pretrain resolution mismatch. Pre-registered
+fallback in `docs/cnn_training_instability_investigation_plan.md` (Status 2026-08-28): if
+ResNet-50 still doesn't beat MobileNetV2 under the item-38 recipe, run one matched pass at
+224px for both backbones. The item-38 Nao trial came in at parity -> this test is now run.
+
+Those 3 functions gained a `resolution=128` keyword arg (**default = exact prior
+behaviour**); the hardcoded `(128, 128)` became `(resolution, resolution)`. No model
+changes: MobileNetV2 (`AdaptiveAvgPool2d((1,1))`) and ResNet-50 (torchvision's built-in
+adaptive avgpool) are both resolution-agnostic.
+
+Threaded as an optional arg that passes nothing unless != 128 (so every prior
+run/checkpoint is byte-for-byte unaffected): `pretrain.py --resolution` and
+`transfer_eval.py --resolution` -> the keyword arg above. This project's wrappers add
+matching `--resolution` to `fedlgr_officedb/pretrain_officedb.py` and
+`transfer_office_to_home.py`, and a `RESOLUTION` env var to
+`domain_transfer_{pretrain,eval}.sbatch` (applied to the zero-shot ceiling eval too --
+the resize must match the checkpoint's pretrain resolution regardless of fine-tuning).
+`submit_domain_transfer_kfold.py` gained `--resolution`; when != 128 it is folded into the
+run-tag and, like `--lr`/`--clip-grad`, *requires* `--run-tag`.
+
+**224px test recipe:** `--lr 1e-4 --clip-grad 1.0 --max-epochs 60 --patience 8
+--resolution 224 --run-tag lr1e4_clip1_es60p8_res224` (Nao, seed 0, 5 folds, both
+backbones -- mirrors the item-38 Nao trial). ResNet needs `--walltime 12:00:00`, MobileNet
+`--walltime 10:00:00` (224px ~= 3x the conv FLOPs/image on CPU).
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

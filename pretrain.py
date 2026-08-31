@@ -70,12 +70,13 @@ def run(args):
         # item 18).
         trainloaders, _testloaders, testloader, _y, _perm = load_datasets(
             num_clients=1, path=args.data, aug=False, batch_size=args.batch_size, DEVICE=DEVICE,
-            action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col)
+            action_cols=action_cols, extra_cols=extra_cols, split_col=args.split_col,
+            resolution=args.resolution)
         train_loader = trainloaders[0]
         eval_loader = testloader
         val_loader = load_val_loader(
             args.data, batch_size=args.batch_size, action_cols=action_cols, extra_cols=extra_cols,
-            split_col=args.split_col) if args.early_stopping else None
+            split_col=args.split_col, resolution=args.resolution) if args.early_stopping else None
     else:
         # Original behavior, unchanged: no split_col means no leakage-safe
         # split is available, so fall back to load_datasets_pretrain's
@@ -85,7 +86,8 @@ def run(args):
         # here, not for a real held-out eval).
         train_loader = load_datasets_pretrain(num_clients=1, split=args.split_ratio, batch_size=args.batch_size,
                                                path=args.data, aug=False, DEVICE=DEVICE,
-                                               action_cols=action_cols, extra_cols=extra_cols)
+                                               action_cols=action_cols, extra_cols=extra_cols,
+                                               resolution=args.resolution)
         eval_loader = train_loader
         val_loader = None
     if args.early_stopping and val_loader is None:
@@ -151,6 +153,10 @@ if __name__ == "__main__":
                          help='If set, clip_grad_norm_ max-norm applied before optimizer.step() in '
                               '--early_stopping training (default None: no clipping, original behavior). '
                               'CNN domain-transfer arm passes 1.0 -- OFFICEDB_MODIFICATIONS.md item 38.')
+    parser.add_argument('--resolution', type=int, default=128,
+                         help='Square input side for transforms.Resize (default 128, the vendor\'s '
+                              'hardcoded value). CNN domain-transfer 224px test passes 224 = both '
+                              'backbones\' native ImageNet resolution -- OFFICEDB_MODIFICATIONS.md item 39.')
     args = parser.parse_args()
 
     print("Running with following arguments:")
