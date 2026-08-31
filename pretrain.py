@@ -10,7 +10,7 @@ import numpy as np
 #add utils from previous folder
 import sys
 sys.path.append('../')
-from utils import train, test, train_with_early_stopping
+from utils import train, test, train_with_early_stopping, train_lp_ft
 def Average(lst):
     return sum(lst) / len(lst)
 def run(args):
@@ -92,15 +92,30 @@ def run(args):
         val_loader = None
     if args.early_stopping and val_loader is None:
         sys.exit("--early_stopping requires --split_col with 'val' rows in the data (none found)")
+    # item 40: --lpft / --freeze_backbone / --weight_decay only affect the
+    # early-stopped training path (train()/train_scaffold() untouched).
+    if (args.lpft or args.freeze_backbone or args.weight_decay) and not args.early_stopping:
+        sys.exit("--lpft / --freeze_backbone / --weight_decay require --early_stopping")
+    if args.lpft and args.freeze_backbone:
+        sys.exit("--lpft and --freeze_backbone are mutually exclusive (LP-FT freezes internally)")
     for i in range(len(models)):
         model=models[i]
         model_n=names[i]
         y_labels=list(range(args.num_classes))
         if args.early_stopping:
-            best_epoch, best_val_loss = train_with_early_stopping(
-                model=model, train_loader=train_loader, val_loader=val_loader, DEVICE=DEVICE,
-                y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience,
-                lr=args.lr, clip_grad_norm=args.clip_grad)
+            if args.lpft:
+                ft_lr = args.lpft_ft_lr if args.lpft_ft_lr is not None else args.lr / 10.0
+                best_epoch, best_val_loss = train_lp_ft(
+                    model=model, train_loader=train_loader, val_loader=val_loader, DEVICE=DEVICE,
+                    y_labels=y_labels, lp_max_epochs=args.max_epochs, lp_patience=args.patience,
+                    lp_lr=args.lr, ft_max_epochs=args.max_epochs, ft_patience=args.patience,
+                    ft_lr=ft_lr, clip_grad_norm=args.clip_grad, weight_decay=args.weight_decay)
+            else:
+                best_epoch, best_val_loss = train_with_early_stopping(
+                    model=model, train_loader=train_loader, val_loader=val_loader, DEVICE=DEVICE,
+                    y_labels=y_labels, max_epochs=args.max_epochs, patience=args.patience,
+                    lr=args.lr, clip_grad_norm=args.clip_grad,
+                    weight_decay=args.weight_decay, freeze_backbone=args.freeze_backbone)
             print(f"Early-stopped at epoch {best_epoch} (val loss {best_val_loss})")
         else:
             train(model=model, train_loader=train_loader, epochs=args.epochs, DEVICE=DEVICE)
@@ -157,6 +172,22 @@ if __name__ == "__main__":
                          help='Square input side for transforms.Resize (default 128, the vendor\'s '
                               'hardcoded value). CNN domain-transfer 224px test passes 224 = both '
                               'backbones\' native ImageNet resolution -- OFFICEDB_MODIFICATIONS.md item 39.')
+    parser.add_argument('--weight_decay', type=float, default=0.0,
+                         help='AdamW decoupled weight decay for --early_stopping training (default '
+                              '0.0 => plain Adam, original behavior). Phase 2 centralized HP search '
+                              'passes 1e-2 -- OFFICEDB_MODIFICATIONS.md item 40.')
+    parser.add_argument('--freeze_backbone', action='store_true',
+                         help='Linear-probe: freeze conv_module, train only fc_module (backbone BN '
+                              'kept in eval mode). Requires --early_stopping; mutually exclusive with '
+                              '--lpft. OFFICEDB_MODIFICATIONS.md item 40.')
+    parser.add_argument('--lpft', action='store_true',
+                         help='LP-FT (Kumar et al., ICLR 2022, arXiv:2202.10054): linear-probe the '
+                              'head with the backbone frozen, then full fine-tune at a lower LR. '
+                              'Uses --lr as the LP LR and --lpft_ft_lr (default --lr/10) as the FT LR. '
+                              'Requires --early_stopping; mutually exclusive with --freeze_backbone. '
+                              'OFFICEDB_MODIFICATIONS.md item 40.')
+    parser.add_argument('--lpft_ft_lr', type=float, default=None,
+                         help='LP-FT stage-2 (full fine-tune) LR. Default: --lr / 10.')
     args = parser.parse_args()
 
     print("Running with following arguments:")

@@ -1606,6 +1606,57 @@ run-tag and, like `--lr`/`--clip-grad`, *requires* `--run-tag`.
 backbones -- mirrors the item-38 Nao trial). ResNet needs `--walltime 12:00:00`, MobileNet
 `--walltime 10:00:00` (224px ~= 3x the conv FLOPs/image on CPU).
 
+## 40. `utils.py`, `pretrain.py` -- optional `weight_decay` / `freeze_backbone` / `lpft` for the Phase 2 centralized HP search
+
+Phase 1 of the centralized CNN HP search (`submit_centralized_hpsearch.py`, no vendor
+change -- swept `lr x clip_grad x resolution`, all already-wired knobs) picked
+**lr=3e-4, clip off** as the winner. Phase 2 (`docs/model_architecture_head_assessment.md`
+§4) sweeps the two levers that need actual training-loop changes: **regularization**
+(the model has no weight decay or dropout anywhere) and **fine-tuning strategy**
+(full-network vs. linear-probe vs. LP-FT).
+
+`train_with_early_stopping()` (`utils.py`) gained two keyword args, **both defaulting to
+the original behaviour exactly**:
+- `weight_decay=0.0` -- when `> 0`, the optimizer becomes `optim.AdamW(trainable, lr,
+  weight_decay=...)` (decoupled decay) instead of `optim.Adam`. `AdamW` with
+  `weight_decay=0` is numerically identical to `Adam`, but the `== 0` branch keeps the
+  literal `optim.Adam` call so every prior run is byte-identical.
+- `freeze_backbone=False` -- when `True`, `model.conv_module.parameters()` get
+  `requires_grad_(False)` and the optimizer is built over the still-trainable params only
+  (the `fc_module` head); `model.conv_module.eval()` is re-asserted after each epoch's
+  `model.train()` so the frozen backbone's BatchNorm stays on its pretrained running
+  stats. `model.load_state_dict(best_state)` still saves/loads the full network
+  (`requires_grad` is not part of a state_dict).
+
+New function `train_lp_ft()` (`utils.py`) -- **LP-FT**, Kumar et al., "Fine-Tuning can
+Distort Pretrained Features and Underperform Out-of-Distribution", ICLR 2022
+(arXiv:2202.10054): two sequential `train_with_early_stopping` calls -- stage 1 with
+`freeze_backbone=True` at `lp_lr`, stage 2 with `freeze_backbone=False` at `ft_lr`
+(`< lp_lr`), resuming from stage 1's best-val weights. Between stages it snapshots the
+stage-1 state and re-enables `requires_grad` on `conv_module`; if stage 2 never beats
+stage 1's val loss it restores the linear-probe weights (a valid LP-FT outcome). No new
+training-loop code -- it only orchestrates the existing function.
+
+`train()` / `train_scaffold()` (the federated per-round local-training paths) are
+**deliberately untouched**, same as items 38-39.
+
+Threaded through as optional args that pass nothing unless set:
+`pretrain.py --weight_decay/--freeze_backbone/--lpft/--lpft_ft_lr` (all require
+`--early_stopping`; `--freeze_backbone` and `--lpft` are mutually exclusive; `--lpft_ft_lr`
+defaults to `--lr / 10`). This project's wrappers add the matching flags to
+`fedlgr_officedb/pretrain_officedb.py` and `WEIGHT_DECAY` / `FREEZE_BACKBONE` / `LPFT` /
+`LPFT_FT_LR` env vars to `domain_transfer_pretrain.sbatch` (not `..._eval.sbatch` -- the
+Phase 2 eval jobs are all zero-shot ceiling `FINETUNE_EPOCHS=0`, no training).
+`transfer_eval.py` is unchanged (its `train_with_early_stopping` call site just doesn't
+pass the new kwargs).
+
+**Phase 2 grid** (`submit_centralized_hpsearch_phase2.py`, Nao / fold 0 / seed 0, fixed
+`lr=3e-4` clip off `--max-epochs 60 --patience 8`): fine-tuning strategy
+`{full, frozen, lpft}` x weight decay `{0, 1e-2}` x resolution `{128, 224}`, minus the
+`full x wd=0` cells (= Phase 1's `lr3e4_clipoff_res{128,224}`). LP-FT uses `lp_lr=3e-4`,
+`ft_lr=3e-5`. Output isolated under `checkpoints_centralized_hpsearch_phase2/` +
+`results/fedlgr_officedb/centralized_hpsearch_phase2/`.
+
 ## Not changed
 
 `dataloader/imageloader.py`'s hardcoded image crop `(295, 0, 295+1018, H)`: verified OfficeDB

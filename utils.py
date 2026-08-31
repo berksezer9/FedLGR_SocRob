@@ -232,7 +232,7 @@ def train_scaffold(model, train_loader, epochs, DEVICE, correction):
 
 
 def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels, max_epochs=40, patience=5,
-							  lr=0.001, clip_grad_norm=None):
+							  lr=0.001, clip_grad_norm=None, weight_decay=0.0, freeze_backbone=False):
 	# lr / clip_grad_norm (OFFICEDB_MODIFICATIONS.md item 38): both default to
 	# the original hardcoded behaviour (Adam lr=1e-3, no clipping). The CNN
 	# domain-transfer arm passes lr=1e-4 + clip_grad_norm=1.0 -- the hardcoded
@@ -262,9 +262,25 @@ def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels,
 	# per round, not "train until convergence") -- those call sites are
 	# unaffected by this addition.
 	criterion = nn.MSELoss()
-	optimizer = optim.Adam(model.parameters(), lr=lr)
+	# weight_decay / freeze_backbone (OFFICEDB_MODIFICATIONS.md item 40): both
+	# default to the original behaviour exactly -- weight_decay=0.0 keeps plain
+	# Adam; freeze_backbone=False keeps the whole network trainable. The Phase 2
+	# centralized HP search passes weight_decay=1e-2 (-> AdamW decoupled decay)
+	# and/or freeze_backbone=True (linear-probe: only fc_module trains, the
+	# conv_module backbone is frozen and kept in eval mode so its BatchNorm
+	# running stats don't drift). train()/train_scaffold() (the federated
+	# per-round paths) are deliberately left untouched, same as item 38.
+	if freeze_backbone:
+		for p in model.conv_module.parameters():
+			p.requires_grad_(False)
+	trainable = [p for p in model.parameters() if p.requires_grad]
+	if weight_decay and weight_decay > 0:
+		optimizer = optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+	else:
+		optimizer = optim.Adam(trainable, lr=lr)
 	model.to(DEVICE)
 	print(f"train_with_early_stopping: lr={lr}, clip_grad_norm={clip_grad_norm}, "
+		  f"weight_decay={weight_decay}, freeze_backbone={freeze_backbone}, "
 		  f"max_epochs={max_epochs}, patience={patience}")
 
 	best_val_loss = float('inf')
@@ -274,6 +290,10 @@ def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels,
 
 	for epoch in range(max_epochs):
 		model.train()
+		if freeze_backbone:
+			# frozen linear-probe: keep the backbone's BatchNorm on its
+			# pretrained running stats (no train-mode stat updates)
+			model.conv_module.eval()
 		running_loss = 0.0
 		for images, labels in train_loader:
 			images, labels = images.to(DEVICE), labels.to(DEVICE)
@@ -306,6 +326,51 @@ def train_with_early_stopping(model, train_loader, val_loader, DEVICE, y_labels,
 
 	model.load_state_dict(best_state)
 	return best_epoch, best_val_loss
+
+
+def train_lp_ft(model, train_loader, val_loader, DEVICE, y_labels,
+				lp_max_epochs=40, lp_patience=5, lp_lr=1e-3,
+				ft_max_epochs=40, ft_patience=5, ft_lr=1e-4,
+				clip_grad_norm=None, weight_decay=0.0):
+	# LP-FT (Kumar et al., "Fine-Tuning can Distort Pretrained Features and
+	# Underperform Out-of-Distribution", ICLR 2022, arXiv:2202.10054).
+	# Stage 1 linear-probes the fc_module head with conv_module frozen, to
+	# val-loss early-stopping convergence. Stage 2 unfreezes the whole network
+	# and fine-tunes at a lower LR (ft_lr < lp_lr), resuming from stage 1's
+	# best-val weights. Rationale: full fine-tuning from a randomly-initialised
+	# head backpropagates large early gradients that distort the pretrained
+	# features (hurts OOD transfer); probing the head first keeps stage-2
+	# gradients small. Implemented as two sequential train_with_early_stopping
+	# calls -- no new training-loop code. OFFICEDB_MODIFICATIONS.md item 40; the
+	# Phase 2 centralized HP search passes lp_lr = the Phase-1-best LR and
+	# ft_lr = lp_lr / 10.
+	print(f"train_lp_ft: stage 1/2 linear probe (lp_lr={lp_lr}, backbone frozen)")
+	lp_epoch, lp_val = train_with_early_stopping(
+		model=model, train_loader=train_loader, val_loader=val_loader, DEVICE=DEVICE,
+		y_labels=y_labels, max_epochs=lp_max_epochs, patience=lp_patience, lr=lp_lr,
+		clip_grad_norm=clip_grad_norm, weight_decay=weight_decay, freeze_backbone=True)
+	# train_with_early_stopping loaded stage 1's best weights but left
+	# requires_grad=False on conv_module (requires_grad is not part of
+	# state_dict, so it is neither saved nor restored) -- snapshot the stage-1
+	# best, then re-enable grad for the full fine-tune.
+	lp_state = copy.deepcopy(model.state_dict())
+	for p in model.conv_module.parameters():
+		p.requires_grad_(True)
+	print(f"train_lp_ft: stage 1/2 done (best epoch {lp_epoch}, val loss {lp_val}); "
+		  f"stage 2/2 full fine-tune (ft_lr={ft_lr}, backbone unfrozen)")
+	ft_epoch, ft_val = train_with_early_stopping(
+		model=model, train_loader=train_loader, val_loader=val_loader, DEVICE=DEVICE,
+		y_labels=y_labels, max_epochs=ft_max_epochs, patience=ft_patience, lr=ft_lr,
+		clip_grad_norm=clip_grad_norm, weight_decay=weight_decay, freeze_backbone=False)
+	if lp_val <= ft_val:
+		# fine-tuning never improved on the linear probe -- keep the LP weights
+		# (this is a valid LP-FT outcome, not a failure: it means the frozen
+		# features were already the best the head could do on this val split).
+		print(f"train_lp_ft: stage 2 val loss {ft_val} did not beat stage 1 {lp_val}; "
+			  f"keeping the linear-probe weights")
+		model.load_state_dict(lp_state)
+		return lp_epoch, lp_val
+	return ft_epoch, ft_val
 
 
 def pearson_correlation(labels, outputs):
